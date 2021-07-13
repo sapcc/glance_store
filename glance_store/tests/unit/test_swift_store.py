@@ -25,7 +25,6 @@ import uuid
 
 from oslo_config import cfg
 from oslo_utils import encodeutils
-from oslo_utils.secretutils import md5
 from oslo_utils import units
 import requests_mock
 import six
@@ -122,8 +121,7 @@ class SwiftTests(object):
                 if kwargs.get('headers'):
                     manifest = kwargs.get('headers').get('X-Object-Manifest')
                     etag = kwargs.get('headers') \
-                                 .get('ETag', md5(
-                                     b'', usedforsecurity=False).hexdigest())
+                                 .get('ETag', hashlib.md5(b'').hexdigest())
                     fixture_headers[fixture_key] = {
                         'manifest': True,
                         'etag': etag,
@@ -135,7 +133,7 @@ class SwiftTests(object):
                     fixture_object = six.BytesIO()
                     read_len = 0
                     chunk = contents.read(CHUNKSIZE)
-                    checksum = md5(usedforsecurity=False)
+                    checksum = hashlib.md5()
                     while chunk:
                         fixture_object.write(chunk)
                         read_len += len(chunk)
@@ -145,8 +143,7 @@ class SwiftTests(object):
                 else:
                     fixture_object = six.BytesIO(contents)
                     read_len = len(contents)
-                    etag = md5(fixture_object.getvalue(),
-                               usedforsecurity=False).hexdigest()
+                    etag = hashlib.md5(fixture_object.getvalue()).hexdigest()
                 if read_len > MAX_SWIFT_OBJECT_SIZE:
                     msg = ('Image size:%d exceeds Swift max:%d' %
                            (read_len, MAX_SWIFT_OBJECT_SIZE))
@@ -424,8 +421,7 @@ class SwiftTests(object):
         self.store.configure()
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents).hexdigest()
         expected_multihash = hashlib.sha256(
             expected_swift_contents).hexdigest()
         expected_image_id = str(uuid.uuid4())
@@ -546,7 +542,7 @@ class SwiftTests(object):
             expected_swift_size = FIVE_KB
             expected_swift_contents = b"*" * expected_swift_size
             expected_checksum = \
-                md5(expected_swift_contents, usedforsecurity=False).hexdigest()
+                hashlib.md5(expected_swift_contents).hexdigest()
             expected_multihash = \
                 hashlib.sha256(expected_swift_contents).hexdigest()
 
@@ -622,8 +618,7 @@ class SwiftTests(object):
         """
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents).hexdigest()
         expected_multihash = \
             hashlib.sha256(expected_swift_contents).hexdigest()
         expected_image_id = str(uuid.uuid4())
@@ -669,8 +664,7 @@ class SwiftTests(object):
         """
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents).hexdigest()
         expected_multihash = \
             hashlib.sha256(expected_swift_contents).hexdigest()
         expected_image_id = str(uuid.uuid4())
@@ -779,7 +773,7 @@ class SwiftTests(object):
             self.store.large_object_size = orig_max_size
 
         # Confirm verifier update called expected number of times
-        self.assertEqual(2 * swift_size / custom_size,
+        self.assertEqual(swift_size / custom_size,
                          verifier.update.call_count)
 
         # define one chunk of the contents
@@ -787,15 +781,10 @@ class SwiftTests(object):
 
         # confirm all expected calls to update have occurred
         calls = [mock.call(swift_contents_piece),
-                 mock.call(b''),
                  mock.call(swift_contents_piece),
-                 mock.call(b''),
                  mock.call(swift_contents_piece),
-                 mock.call(b''),
                  mock.call(swift_contents_piece),
-                 mock.call(b''),
-                 mock.call(swift_contents_piece),
-                 mock.call(b'')]
+                 mock.call(swift_contents_piece)]
         verifier.update.assert_has_calls(calls)
 
     @mock.patch('glance_store._drivers.swift.utils'
@@ -891,8 +880,7 @@ class SwiftTests(object):
         """
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents).hexdigest()
         expected_multihash = \
             hashlib.sha256(expected_swift_contents).hexdigest()
         expected_image_id = str(uuid.uuid4())
@@ -946,8 +934,7 @@ class SwiftTests(object):
         # Set up a 'large' image of 5KB
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents).hexdigest()
         expected_multihash = \
             hashlib.sha256(expected_swift_contents).hexdigest()
         expected_image_id = str(uuid.uuid4())
@@ -1154,14 +1141,15 @@ class SwiftTests(object):
             return None, [{'name': '%s-%03d' % (test_image_id, x)}
                           for x in range(1, 6)]
 
+        def fake_post_account(headers, query_string, data):
+            if query_string == 'bulk-delete':
+                global SWIFT_POST_ACCOUNT_CALLS
+                SWIFT_POST_ACCOUNT_CALLS += 1
+            return None, b'{}'
+
         def fake_delete_object(container, object_name):
-            # Simulate error on 1st and 3rd segments
             global SWIFT_DELETE_OBJECT_CALLS
             SWIFT_DELETE_OBJECT_CALLS += 1
-            if object_name.endswith('-001') or object_name.endswith('-003'):
-                raise swiftclient.ClientException('Object DELETE failed')
-            else:
-                pass
 
         conf = copy.deepcopy(SWIFT_CONF)
         self.config(**conf)
@@ -1177,13 +1165,79 @@ class SwiftTests(object):
         conn.delete_object = fake_delete_object
         conn.head_object = fake_head_object
         conn.get_container = fake_get_container
+        conn.post_account = fake_post_account
 
         global SWIFT_DELETE_OBJECT_CALLS
         SWIFT_DELETE_OBJECT_CALLS = 0
 
+        global SWIFT_POST_ACCOUNT_CALLS
+        SWIFT_POST_ACCOUNT_CALLS = 0
+
         self.store.delete(loc, connection=conn)
-        # Expecting 6 delete calls, 5 for the segments and 1 for the manifest
-        self.assertEqual(6, SWIFT_DELETE_OBJECT_CALLS)
+        # Expecting 1 delete call for the bulk delete image segments
+        # and 1 delete call for the manifest
+        ACTUAL_DELETE_CALLS = \
+            SWIFT_DELETE_OBJECT_CALLS + SWIFT_POST_ACCOUNT_CALLS
+        self.assertEqual(2, ACTUAL_DELETE_CALLS)
+
+    def test_delete_with_fallback_to_sequential_segment_delete(self):
+        """
+        Tests that delete of a segmented object with failed ``bulk-delete``
+        query and fallback to sequential segment deletion.
+        """
+
+        test_image_id = str(uuid.uuid4())
+
+        def fake_head_object(container, object_name):
+            object_manifest = '/'.join([container, object_name]) + '-'
+            return {'x-object-manifest': object_manifest}
+
+        def fake_get_container(container, **kwargs):
+            # Returning 5 fake segments
+            return None, [{'name': '%s-%03d' % (test_image_id, x)}
+                          for x in range(1, 6)]
+
+        def fake_post_account(headers, query_string, data):
+            # This function simulates empty body which means,
+            # disabled bulk-delete functionality and fallback to sequential
+            # delete of chunks
+            if query_string == 'bulk-delete':
+                global SWIFT_POST_ACCOUNT_CALLS
+                SWIFT_POST_ACCOUNT_CALLS += 1
+            return None, b''
+
+        def fake_delete_object(container, object_name):
+            global SWIFT_DELETE_OBJECT_CALLS
+            SWIFT_DELETE_OBJECT_CALLS += 1
+
+        conf = copy.deepcopy(SWIFT_CONF)
+        self.config(**conf)
+        moves.reload_module(swift)
+        self.store = Store(self.conf)
+        self.store.configure()
+
+        loc_uri = "swift+https://%s:key@localhost:8080/glance/%s"
+        loc_uri = loc_uri % (self.swift_store_user, test_image_id)
+        loc = location.get_location_from_uri(loc_uri)
+
+        conn = self.store.get_connection(loc.store_location)
+        conn.delete_object = fake_delete_object
+        conn.head_object = fake_head_object
+        conn.get_container = fake_get_container
+        conn.post_account = fake_post_account
+
+        global SWIFT_DELETE_OBJECT_CALLS
+        SWIFT_DELETE_OBJECT_CALLS = 0
+
+        global SWIFT_POST_ACCOUNT_CALLS
+        SWIFT_POST_ACCOUNT_CALLS = 0
+
+        self.store.delete(loc, connection=conn)
+        # Expecting 1 delete call for the bulk delete image segments
+        # and 1 delete call for the manifest
+        ACTUAL_DELETE_CALLS = \
+            SWIFT_DELETE_OBJECT_CALLS + SWIFT_POST_ACCOUNT_CALLS
+        self.assertEqual(7, ACTUAL_DELETE_CALLS)
 
     def test_read_acl_public(self):
         """
@@ -1303,9 +1357,9 @@ class SwiftTests(object):
         trustee_client = mock.MagicMock()
         trustee_client.session.get_user_id.return_value = 'fake_user'
         trustor_client = mock.MagicMock()
-        trustor_client.session.auth.get_auth_ref.return_value = {
-            'roles': [{'name': 'fake_role'}]
-        }
+        fake_auth_ref = mock.Mock()
+        fake_auth_ref.role_names = ['fake_role']
+        trustor_client.session.auth.get_auth_ref = fake_auth_ref
         trustor_client.trusts.create.return_value = mock.MagicMock(
             id='fake_trust')
         main_client = mock.MagicMock()
@@ -1320,7 +1374,7 @@ class SwiftTests(object):
         mock_identity.V3Token.assert_called_once_with(
             auth_url=default_swift_reference.get('auth_address'),
             token=ctxt.auth_token,
-            project_id=ctxt.project_id
+            project_id=ctxt.tenant
         )
         mock_session.Session.assert_any_call(auth=mock_identity.V3Token(),
                                              verify=verify)
@@ -1342,9 +1396,9 @@ class SwiftTests(object):
                                              verify=verify)
         mock_client.Client.assert_any_call(session=trustee_session)
         trustor_client.trusts.create.assert_called_once_with(
-            trustee_user='fake_user', trustor_user=ctxt.user_id,
-            project=ctxt.project_id, impersonation=True,
-            role_names=['fake_role']
+            trustee_user='fake_user', trustor_user=ctxt.user,
+            project=ctxt.tenant, impersonation=True,
+            role_names=fake_auth_ref().role_names
         )
         mock_identity.V3Password.assert_any_call(
             auth_url=default_swift_reference.get('auth_address'),
@@ -1930,14 +1984,14 @@ class TestChunkReader(base.StoreBaseTest):
         """
         CHUNKSIZE = 100
         data = b'*' * units.Ki
-        expected_checksum = md5(data, usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(data).hexdigest()
         expected_multihash = hashlib.sha256(data).hexdigest()
         data_file = tempfile.NamedTemporaryFile()
         data_file.write(data)
         data_file.flush()
         infile = open(data_file.name, 'rb')
         bytes_read = 0
-        checksum = md5(usedforsecurity=False)
+        checksum = hashlib.md5()
         os_hash_value = hashlib.sha256()
         while True:
             cr = swift.ChunkReader(infile, checksum, os_hash_value, CHUNKSIZE)
@@ -1959,10 +2013,10 @@ class TestChunkReader(base.StoreBaseTest):
         Replicate what goes on in the Swift driver with the
         repeated creation of the ChunkReader object
         """
-        expected_checksum = md5(b'', usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(b'').hexdigest()
         expected_multihash = hashlib.sha256(b'').hexdigest()
         CHUNKSIZE = 100
-        checksum = md5(usedforsecurity=False)
+        checksum = hashlib.md5()
         os_hash_value = hashlib.sha256()
         data_file = tempfile.NamedTemporaryFile()
         infile = open(data_file.name, 'rb')
@@ -2058,7 +2112,7 @@ class TestBufferedReader(base.StoreBaseTest):
         self.infile = six.BytesIO(s)
         self.infile.seek(0)
 
-        self.checksum = md5(usedforsecurity=False)
+        self.checksum = hashlib.md5()
         self.hash_algo = HASH_ALGO
         self.os_hash_value = hashlib.sha256()
         self.verifier = mock.MagicMock(name='mock_verifier')
@@ -2118,7 +2172,7 @@ class TestBufferedReader(base.StoreBaseTest):
 
     def test_checksums(self):
         # checksums are updated only once on a full segment read
-        expected_csum = md5(usedforsecurity=False)
+        expected_csum = hashlib.md5()
         expected_csum.update(b'1234567')
         expected_multihash = hashlib.sha256()
         expected_multihash.update(b'1234567')
@@ -2130,7 +2184,7 @@ class TestBufferedReader(base.StoreBaseTest):
     def test_checksum_updated_only_once_w_full_segment_read(self):
         # Test that checksums are updated only once when a full segment read
         # is followed by a seek and partial reads.
-        expected_csum = md5(usedforsecurity=False)
+        expected_csum = hashlib.md5()
         expected_csum.update(b'1234567')
         expected_multihash = hashlib.sha256()
         expected_multihash.update(b'1234567')
@@ -2145,7 +2199,7 @@ class TestBufferedReader(base.StoreBaseTest):
     def test_checksum_updates_during_partial_segment_reads(self):
         # Test to check that checksums are updated with only the bytes
         # not seen when the number of bytes being read is changed
-        expected_csum = md5(usedforsecurity=False)
+        expected_csum = hashlib.md5()
         expected_multihash = hashlib.sha256()
         self.reader.read(4)
         expected_csum.update(b'1234')
@@ -2168,7 +2222,7 @@ class TestBufferedReader(base.StoreBaseTest):
 
     def test_checksum_rolling_calls(self):
         # Test that the checksum continues on to the next segment
-        expected_csum = md5(usedforsecurity=False)
+        expected_csum = hashlib.md5()
         expected_multihash = hashlib.sha256()
         self.reader.read(7)
         expected_csum.update(b'1234567')
@@ -2237,7 +2291,7 @@ class TestBufferedReader(base.StoreBaseTest):
         infile = six.BytesIO(s)
         infile.seek(0)
         total = 7
-        checksum = md5(usedforsecurity=False)
+        checksum = hashlib.md5()
         os_hash_value = hashlib.sha256()
         self.reader = buffered.BufferedReader(
             infile, checksum, os_hash_value, total)
@@ -2262,14 +2316,14 @@ class TestBufferedReader(base.StoreBaseTest):
         """
         CHUNKSIZE = 100
         data = b'*' * units.Ki
-        expected_checksum = md5(data, usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(data).hexdigest()
         expected_multihash = hashlib.sha256(data).hexdigest()
         data_file = tempfile.NamedTemporaryFile()
         data_file.write(data)
         data_file.flush()
         infile = open(data_file.name, 'rb')
         bytes_read = 0
-        checksum = md5(usedforsecurity=False)
+        checksum = hashlib.md5()
         os_hash_value = hashlib.sha256()
         while True:
             cr = buffered.BufferedReader(infile, checksum, os_hash_value,
