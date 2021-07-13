@@ -15,31 +15,35 @@
 
 """Storage backend for SWIFT"""
 
-import logging
-import math
+import hashlib
 
+from concurrent import futures
 from keystoneauth1.access import service_catalog as keystone_sc
 from keystoneauth1 import identity as ks_identity
 from keystoneauth1 import session as ks_session
 from keystoneclient.v3 import client as ks_client
 from oslo_config import cfg
+from oslo_log import log as logging
 from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import units
 import six
 from six.moves import http_client
 from six.moves import urllib
+from six.moves.urllib.parse import quote
 try:
     import swiftclient
+    from swiftclient.utils import parse_api_response
 except ImportError:
     swiftclient = None
+from time import sleep
 
 import glance_store
 from glance_store._drivers.swift import buffered
 from glance_store._drivers.swift import connection_manager
 from glance_store._drivers.swift import utils as sutils
 from glance_store import capabilities
-from glance_store.common import utils as gutils
+from glance_store.common import utils as cutils
 from glance_store import driver
 from glance_store import exceptions
 from glance_store.i18n import _, _LE, _LI
@@ -51,6 +55,8 @@ LOG = logging.getLogger(__name__)
 DEFAULT_CONTAINER = 'glance'
 DEFAULT_LARGE_OBJECT_SIZE = 5 * units.Ki  # 5GB
 DEFAULT_LARGE_OBJECT_CHUNK_SIZE = 200  # 200M
+DEFAULT_THREAD_POOL_SIZE = 1  # 1 thread
+DEFAULT_CONTAINER_DELETE_ATTEMPTS = 5  # how many times retry deletion
 ONE_MB = units.k * units.Ki  # Here we used the mixed meaning of MB
 
 _SWIFT_OPTS = [
@@ -243,6 +249,7 @@ Possible values:
 
 Related options:
     * ``swift_store_large_object_chunk_size``
+    * ``swift_store_thread_pool_size``
 
 """),
     cfg.IntOpt('swift_store_large_object_chunk_size',
@@ -266,6 +273,23 @@ Possible values:
 
 Related options:
     * ``swift_store_large_object_size``
+    * ``swift_store_thread_pool_size``
+
+"""),
+    cfg.IntOpt('swift_store_thread_pool_size',
+               default=DEFAULT_THREAD_POOL_SIZE,
+               help="""
+The number of threads in the pool to perform a multipart upload in Swift.
+
+This configuration option takes the number of threads in the pool when
+performing a Multipart Upload.
+
+Possible values:
+    * Any positive integer value
+
+Related Options:
+    * ``swift_store_large_object_size``
+    * ``swift_store_large_object_chunk_size``
 
 """),
     cfg.BoolOpt('swift_store_create_container_on_put', default=False,
@@ -422,6 +446,20 @@ Related Options:
     * None
 
 """),
+    cfg.IntOpt('swift_container_delete_timeout',
+               min=1,
+               default=1,
+               help="""
+Time in seconds defining the size of the window in which a new
+delete attempt may be requested.
+
+Possible values:
+    * Positive integer value
+
+Related Options:
+    * None
+
+"""),
     cfg.BoolOpt('swift_store_use_trusts',
                 default=True,
                 help="""
@@ -475,6 +513,53 @@ Related options:
 
 """),
 ]
+
+
+class UploadPart(object):
+    """The class for the upload part."""
+    def __init__(self, fp, partnum, chunks):
+        self.partnum = partnum
+        self.fp = fp
+        self.size = 0
+        self.chunks = chunks
+        self.etag = {}
+        self.success = True
+        self.name = None
+
+
+def run_upload(manager, location, part, context):
+    pnum = part.partnum
+    bsize = part.chunks
+    chunk_name = "%s-%05d" % (location.obj, pnum)
+    LOG.debug("Uploading upload part in Swift partnum=%(pnum)d, "
+              "size=%(bsize)d, key=%(chunk_name)s",
+              {'pnum': pnum, 'bsize': bsize, 'chunk_name': chunk_name},
+              context=context)
+    try:
+        chunk_etag = \
+            manager.get_connection().put_object(
+                location.container,
+                chunk_name, part.fp,
+                content_length=bsize)
+        part.etag[pnum] = chunk_etag
+        part.size = bsize
+        part.name = chunk_name
+    except Exception:
+        LOG.error(_("Error during chunked upload to backend, deleting stale "
+                    "chunks."), context=context)
+        part.success = False
+    finally:
+        part.fp.close()
+    msg = (
+        "Wrote chunk %(chunk_name)s with id %(chunk_id)d of length "
+        "%(bytes_read)d to Swift returning MD5 of content: %(chunk_etag)s" % {
+            'chunk_name': chunk_name,
+            'chunk_id': pnum,
+            'bytes_read': bsize,
+            'chunk_etag': chunk_etag
+        }
+    )
+    LOG.debug(msg, context=context)
 
 
 def swift_retry_iter(resp_iter, length, store, location, manager):
@@ -799,10 +884,22 @@ class BaseStore(driver.Store):
         self.large_object_size = _obj_size * ONE_MB
         _chunk_size = self._option_get('swift_store_large_object_chunk_size')
         self.large_object_chunk_size = _chunk_size * ONE_MB
+        self.swift_store_thread_pool_size = self._option_get(
+            'swift_store_thread_pool_size')
+        if self.swift_store_thread_pool_size <= 0:
+            msg = _(
+                "swift_store_thread_pool_size must be a positive integer. %s"
+            ) % self.swift_store_thread_pool_size
+            LOG.error(msg)
+            raise exceptions.BadStoreConfiguration(
+                store_name="swift", reason=msg
+            )
         self.admin_tenants = glance_conf.swift_store_admin_tenants
         self.region = glance_conf.swift_store_region
         self.service_type = glance_conf.swift_store_service_type
         self.conf_endpoint = glance_conf.swift_store_endpoint
+        self.container_delete_timeout = \
+            glance_conf.swift_container_delete_timeout
         self.endpoint_type = glance_conf.swift_store_endpoint_type
         self.insecure = glance_conf.swift_store_auth_insecure
         self.ssl_compression = glance_conf.swift_store_ssl_compression
@@ -899,16 +996,61 @@ class BaseStore(driver.Store):
                                                    reason=reason)
         return result
 
-    def _delete_stale_chunks(self, connection, container, chunk_list):
-        for chunk in chunk_list:
-            LOG.debug("Deleting chunk %s" % chunk)
+    def _delete_chunks_sequential(self, connection, container, chunk_list):
+        for chunk_name in chunk_list:
+            LOG.debug("Deleting chunk %s" % chunk_name)
             try:
-                connection.delete_object(container, chunk)
+                connection.delete_object(container, chunk_name)
             except Exception:
                 msg = _("Failed to delete orphaned chunk "
                         "%(container)s/%(chunk)s")
                 LOG.exception(msg % {'container': container,
-                                     'chunk': chunk})
+                                     'chunk': chunk_name})
+
+    def _delete_chunks(self, connection, container, chunk_list):
+        LOG.debug(
+            "Deleting %(num_chunks)s chunks "
+            "from container %(container_name)s" % {
+                "num_chunks": len(chunk_list),
+                "container_name": container
+            }
+        )
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'text/plain',
+        }
+        objects = [
+            quote(('/%s/%s' % (container, chunk)).encode('utf-8'))
+            for chunk in chunk_list
+        ]
+        request_body = b''.join(
+            obj.encode('utf-8') + b'\n' for obj in objects)
+        try:
+            resp, body = connection.post_account(
+                headers=headers,
+                query_string='bulk-delete',
+                data=request_body,
+            )
+        except swiftclient.ClientException as e:
+            if e.http_status == http_client.NOT_FOUND:
+                # segement already deleted, that is OK.
+                pass
+            else:
+                msg = _('Unable to bulk_delete object. Error: %(error)s')
+                msg = msg % {'error': e}
+                LOG.exception(msg)
+        if not body:
+            msg = _('No content received on account POST. '
+                    'Is the bulk operations middleware enabled?')
+            LOG.exception(msg)
+            LOG.debug("Try to delete chunks in a sequential way as a fallback.")
+            self._delete_chunks_sequential(connection, container, chunk_list)
+            LOG.debug("Done sequential delete of chunks.")
+        else:
+            LOG.debug(
+                "Done bulk delete of chunks with response: %s" %
+                parse_api_response(headers, body)
+            )
 
     @driver.back_compat_add
     @capabilities.check
@@ -931,109 +1073,63 @@ class BaseStore(driver.Store):
         :raises: `glance_store.exceptions.Duplicate` if something already
                 exists at this location
         """
-        os_hash_value = gutils.get_hasher(hashing_algo, False)
+        os_hash_value = hashlib.new(str(hashing_algo))
         location = self.create_location(image_id, context=context)
         # initialize a manager with re-auth if image need to be splitted
         need_chunks = (image_size == 0) or (
             image_size >= self.large_object_size)
+
         with self.get_manager(location, context,
                               allow_reauth=need_chunks) as manager:
-
             self._create_container_if_missing(location.container,
                                               manager.get_connection())
-
             LOG.debug("Adding image object '%(obj_name)s' "
                       "to Swift" % dict(obj_name=location.obj))
             try:
+                checksum = hashlib.md5()
                 if not need_chunks:
                     # Image size is known, and is less than large_object_size.
                     # Send to Swift with regular PUT.
-                    checksum = gutils.get_hasher('md5', False)
                     reader = ChunkReader(image_file, checksum,
                                          os_hash_value, image_size,
                                          verifier=verifier)
                     obj_etag = manager.get_connection().put_object(
                         location.container, location.obj,
                         reader, content_length=image_size)
+
                 else:
                     # Write the image into Swift in chunks.
-                    chunk_id = 1
-                    if image_size > 0:
-                        total_chunks = str(int(
-                            math.ceil(float(image_size) /
-                                      float(self.large_object_chunk_size))))
-                    else:
-                        # image_size == 0 is when we don't know the size
-                        # of the image. This can occur with older clients
-                        # that don't inspect the payload size.
-                        LOG.debug("Cannot determine image size because it is "
-                                  "either not provided in the request or "
-                                  "chunked-transfer encoding is used. "
-                                  "Adding image as a segmented object to "
-                                  "Swift.")
-                        total_chunks = '?'
+                    total_size, plist = self._upload_chunks(
+                        image_file,
+                        checksum,
+                        os_hash_value,
+                        manager,
+                        location,
+                        verifier,
+                        context,
+                    )
+                    success = True
+                    for part in plist:
+                        if not part.success:
+                            success = False
+                            break
 
-                    checksum = gutils.get_hasher('md5', False)
-                    written_chunks = []
-                    combined_chunks_size = 0
-                    while True:
-                        chunk_size = self.large_object_chunk_size
-                        if image_size == 0:
-                            content_length = None
-                        else:
-                            left = image_size - combined_chunks_size
-                            if left == 0:
-                                break
-                            if chunk_size > left:
-                                chunk_size = left
-                            content_length = chunk_size
+                    if not success:
+                        # Delete orphaned segments from swift backend
+                        with excutils.save_and_reraise_exception():
+                            LOG.error(_("Error during chunked upload "
+                                        "to backend, deleting stale "
+                                        "chunks."))
+                            chunk_names = [chunk.name for chunk in plist]
+                            self._delete_chunks(
+                                manager.get_connection(),
+                                location.container,
+                                chunk_names)
 
-                        chunk_name = "%s-%05d" % (location.obj, chunk_id)
-
-                        with self.reader_class(
-                                image_file, checksum, os_hash_value,
-                                chunk_size, verifier,
-                                backend_group=self.backend_group) as reader:
-                            if reader.is_zero_size is True:
-                                LOG.debug('Not writing zero-length chunk.')
-                                break
-
-                            try:
-                                chunk_etag = \
-                                    manager.get_connection().put_object(
-                                        location.container,
-                                        chunk_name, reader,
-                                        content_length=content_length)
-                                written_chunks.append(chunk_name)
-                            except Exception:
-                                # Delete orphaned segments from swift backend
-                                with excutils.save_and_reraise_exception():
-                                    LOG.error(_("Error during chunked upload "
-                                                "to backend, deleting stale "
-                                                "chunks."))
-                                    self._delete_stale_chunks(
-                                        manager.get_connection(),
-                                        location.container,
-                                        written_chunks)
-
-                            bytes_read = reader.bytes_read
-                            msg = ("Wrote chunk %(chunk_name)s (%(chunk_id)d/"
-                                   "%(total_chunks)s) of length %(bytes_read)"
-                                   "d to Swift returning MD5 of content: "
-                                   "%(chunk_etag)s" %
-                                   {'chunk_name': chunk_name,
-                                    'chunk_id': chunk_id,
-                                    'total_chunks': total_chunks,
-                                    'bytes_read': bytes_read,
-                                    'chunk_etag': chunk_etag})
-                            LOG.debug(msg)
-
-                        chunk_id += 1
-                        combined_chunks_size += bytes_read
                     # In the case we have been given an unknown image size,
                     # set the size to the total size of the combined chunks.
                     if image_size == 0:
-                        image_size = combined_chunks_size
+                        image_size = total_size
 
                     # Now we write the object manifest in X-Object-Manifest
                     # header as defined for Dynamic Large Objects (DLO) Mode.
@@ -1081,6 +1177,37 @@ class BaseStore(driver.Store):
                 LOG.error(msg)
                 raise glance_store.BackendException(msg)
 
+    def _upload_chunks(self, image_file, checksum, os_hash_value,
+                       manager, location, verifier, context):
+        chunk_id = 0
+        total_size = 0
+        plist = []
+
+        it = cutils.chunkreadable(image_file, self.large_object_chunk_size)
+        workers = self.swift_store_thread_pool_size
+        futs = []
+        with futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            for write_chunk in it:
+                os_hash_value.update(write_chunk)
+                checksum.update(write_chunk)
+                if verifier:
+                    verifier.update(write_chunk)
+                fp = six.BytesIO(write_chunk)
+                fp.seek(0)
+                part_size = len(write_chunk)
+                part = UploadPart(fp, chunk_id + 1, part_size)
+                futs.append(executor.submit(
+                    run_upload, manager, location, part, context))
+                plist.append(part)
+                total_size += part_size
+                chunk_id += 1
+
+        # Wait until all futures are complete
+        for fut in futures.as_completed(futs):
+            pass
+
+        return total_size, plist
+
     @capabilities.check
     def delete(self, location, connection=None, context=None):
         location = location.store_location
@@ -1115,18 +1242,8 @@ class BaseStore(driver.Store):
                 obj_container, obj_prefix = dlo_manifest.split('/', 1)
                 segments = connection.get_container(
                     obj_container, prefix=obj_prefix)[1]
-                for segment in segments:
-                    # TODO(jaypipes): This would be an easy area to parallelize
-                    # since we're simply sending off parallelizable requests
-                    # to Swift to delete stuff. It's not like we're going to
-                    # be hogging up network or file I/O here...
-                    try:
-                        connection.delete_object(obj_container,
-                                                 segment['name'])
-                    except swiftclient.ClientException:
-                        msg = _('Unable to delete segment %(segment_name)s')
-                        msg = msg % {'segment_name': segment['name']}
-                        LOG.exception(msg)
+                chunk_names = [chunk["name"] for chunk in segments]
+                self._delete_chunks(connection, obj_container, chunk_names)
 
             # Delete object (or, in segmented case, the manifest)
             connection.delete_object(location.container, location.obj)
@@ -1507,7 +1624,23 @@ class MultiTenantStore(BaseStore):
             connection = self.get_connection(location.store_location,
                                              context=context)
         super(MultiTenantStore, self).delete(location, connection)
-        connection.delete_container(location.store_location.container)
+
+        delete_attempt = 0
+        while delete_attempt < DEFAULT_CONTAINER_DELETE_ATTEMPTS:
+            delete_attempt += 1
+            try:
+                connection.delete_container(location.store_location.container)
+                break
+            except swiftclient.ClientException as e:
+                if e.http_status == http_client.NOT_FOUND:
+                    # container is deleted, exit the loop
+                    break
+                elif (e.http_status == http_client.CONFLICT and
+                          delete_attempt != DEFAULT_CONTAINER_DELETE_ATTEMPTS):
+                    # wait, as the image segments might still be removing
+                    sleep(self.container_delete_timeout)
+                else:
+                    raise
 
     def set_acls(self, location, public=False, read_tenants=None,
                  write_tenants=None, connection=None, context=None):
@@ -1599,12 +1732,11 @@ class MultiTenantStore(BaseStore):
         # create client for multitenant user(trustor)
         trustor_auth = ks_identity.V3Token(auth_url=auth_address,
                                            token=context.auth_token,
-                                           project_id=context.project_id)
+                                           project_id=context.tenant)
         trustor_sess = ks_session.Session(auth=trustor_auth,
                                           verify=self.ks_verify)
         trustor_client = ks_client.Client(session=trustor_sess)
         auth_ref = trustor_client.session.auth.get_auth_ref(trustor_sess)
-        roles = [t['name'] for t in auth_ref['roles']]
 
         # create client for trustee - glance user specified in swift config
         tenant_name, user = user.split(':')
@@ -1626,9 +1758,9 @@ class MultiTenantStore(BaseStore):
 
         # create trust for trustee user
         trust_id = trustor_client.trusts.create(
-            trustee_user=trustee_user_id, trustor_user=context.user_id,
-            project=context.project_id, impersonation=True,
-            role_names=roles
+            trustee_user=trustee_user_id, trustor_user=context.user,
+            project=context.tenant, impersonation=True,
+            role_names=auth_ref.role_names
         ).id
         # initialize a new client with trust and trustee credentials
         # create client for glance trustee user
