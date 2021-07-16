@@ -1173,13 +1173,80 @@ class SwiftTests(object):
         conn.delete_object = fake_delete_object
         conn.head_object = fake_head_object
         conn.get_container = fake_get_container
+        conn.post_account = fake_post_account
 
         global SWIFT_DELETE_OBJECT_CALLS
         SWIFT_DELETE_OBJECT_CALLS = 0
 
+        global SWIFT_POST_ACCOUNT_CALLS
+        SWIFT_POST_ACCOUNT_CALLS = 0
+
         self.store.delete(loc, connection=conn)
-        # Expecting 6 delete calls, 5 for the segments and 1 for the manifest
-        self.assertEqual(6, SWIFT_DELETE_OBJECT_CALLS)
+        # Expecting 1 delete call for the bulk delete image segments
+        # and 1 delete call for the manifest
+        ACTUAL_DELETE_CALLS = \
+            SWIFT_DELETE_OBJECT_CALLS + SWIFT_POST_ACCOUNT_CALLS
+        self.assertEqual(2, ACTUAL_DELETE_CALLS)
+
+    def test_delete_with_fallback_to_sequential_segment_delete(self):
+        """
+        Tests that delete of a segmented object with failed ``bulk-delete``
+        query and fallback to sequential segment deletion.
+        """
+
+        test_image_id = str(uuid.uuid4())
+
+        def fake_head_object(container, object_name):
+            object_manifest = '/'.join([container, object_name]) + '-'
+            return {'x-object-manifest': object_manifest}
+
+        def fake_get_container(container, **kwargs):
+            # Returning 5 fake segments
+            return None, [{'name': '%s-%03d' % (test_image_id, x)}
+                          for x in range(1, 6)]
+
+        def fake_post_account(headers, query_string, data):
+            # This function simulates empty body which means,
+            # disabled bulk-delete functionality and fallback to sequential
+            # delete of chunks
+            if query_string == 'bulk-delete':
+                global SWIFT_POST_ACCOUNT_CALLS
+                SWIFT_POST_ACCOUNT_CALLS += 1
+            return None, b''
+
+        def fake_delete_object(container, object_name):
+            global SWIFT_DELETE_OBJECT_CALLS
+            SWIFT_DELETE_OBJECT_CALLS += 1
+
+        conf = copy.deepcopy(SWIFT_CONF)
+        self.config(**conf)
+        moves.reload_module(swift)
+        self.store = Store(self.conf)
+        self.store.configure()
+
+        loc_uri = "swift+https://%s:key@localhost:8080/glance/%s"
+        loc_uri = loc_uri % (self.swift_store_user, test_image_id)
+        loc = location.get_location_from_uri(loc_uri)
+
+        conn = self.store.get_connection(loc.store_location)
+        conn.delete_object = fake_delete_object
+        conn.head_object = fake_head_object
+        conn.get_container = fake_get_container
+        conn.post_account = fake_post_account
+
+        global SWIFT_DELETE_OBJECT_CALLS
+        SWIFT_DELETE_OBJECT_CALLS = 0
+
+        global SWIFT_POST_ACCOUNT_CALLS
+        SWIFT_POST_ACCOUNT_CALLS = 0
+
+        self.store.delete(loc, connection=conn)
+        # Expecting 1 delete call for the bulk delete image segments
+        # and 1 delete call for the manifest
+        ACTUAL_DELETE_CALLS = \
+            SWIFT_DELETE_OBJECT_CALLS + SWIFT_POST_ACCOUNT_CALLS
+        self.assertEqual(7, ACTUAL_DELETE_CALLS)
+
 
     def test_read_acl_public(self):
         """
