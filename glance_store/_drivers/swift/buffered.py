@@ -9,13 +9,13 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
-import logging
+0
 import socket
 import tempfile
 
 from oslo_config import cfg
 from oslo_utils import encodeutils
+from oslo_log import log as logging
 
 from glance_store import exceptions
 from glance_store.i18n import _
