@@ -9,7 +9,6 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-0
 import socket
 import tempfile
 
@@ -134,9 +133,9 @@ class BufferedReader(object):
             self.update_position += abs(update)
         return result
 
-    def _buffer(self):
+    def _buffer(self, context=None):
         to_buffer = self.total
-        LOG.debug("Buffering %s bytes of image segment" % to_buffer)
+        LOG.debug(_("Buffering %s bytes of image segment" % to_buffer),context=context)
         buffer_read_count = 0
         while not self._buffered:
             read_size = min(to_buffer, READ_SIZE)
