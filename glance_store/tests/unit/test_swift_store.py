@@ -1150,6 +1150,12 @@ class SwiftTests(object):
             return None, [{'name': '%s-%03d' % (test_image_id, x)}
                           for x in range(1, 6)]
 
+        def fake_post_account(headers, query_string, data):
+            if query_string == 'bulk-delete':
+                global SWIFT_POST_ACCOUNT_CALLS
+                SWIFT_POST_ACCOUNT_CALLS += 1
+            return None, b'{}'
+
         def fake_delete_object(container, object_name):
             # Simulate error on 1st and 3rd segments
             global SWIFT_DELETE_OBJECT_CALLS
