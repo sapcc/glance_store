@@ -522,11 +522,8 @@ def run_upload(manager, location, part, context):
 
     pnum = part.partnum
     bsize = part.chunks
+    chunk_etag = None
     chunk_name = "%s-%05d" % (location.obj, pnum)
-    LOG.debug("Uploading upload part in Swift partnum=%(pnum)d, "
-              "size=%(bsize)d, key=%(chunk_name)s",
-              {'pnum': pnum, 'bsize': bsize, 'chunk_name': chunk_name},
-              context=context)
     try:
         chunk_etag = \
             manager.get_connection().put_object(
@@ -535,23 +532,17 @@ def run_upload(manager, location, part, context):
                 content_length=bsize)
         part.etag[pnum] = chunk_etag
         part.size = bsize
-        part.size = chunk_name
-    except Exception:
+        part.name = chunk_name
+    except Exception as exc:
         LOG.error(_("Error during chunked upload to backend, deleting stale "
-                    "chunks."),context=context)
+                    "chunks. Exception: %(exc)s", {'exc': exc}),
+                    context=context)
         part.success = False
     finally:
         part.fp.close()
-    msg = (
-        "Wrote chunk %(chunk_name)s with id %(chunk_id)d of length "
-        "%(bytes_read)d to Swift returning MD5 of content: %(chunk_etag)s" % {
-            'chunk_name': chunk_name,
-            'chunk_id': pnum,
-            'bytes_read': bsize,
-            'chunk_etag': chunk_etag
-        }
-    )
-    LOG.debug(msg,context=context)
+
+    return (chunk_etag, chunk_name, pnum, bsize)
+
 
 def swift_retry_iter(resp_iter, length, store, location, manager):
     if not length and isinstance(resp_iter, six.BytesIO):
@@ -1188,6 +1179,14 @@ class BaseStore(driver.Store):
                 fp.seek(0)
                 part_size = len(write_chunk)
                 part = UploadPart(fp, chunk_id + 1, part_size)
+                pnum = part.partnum
+                bsize = part.chunks
+                chunk_name = "%s-%05d" % (location.obj, pnum)
+                LOG.debug("Uploading upload part in Swift partnum=%(pnum)d, "
+                          "size=%(bsize)d, key=%(chunk_name)s",
+                          {'pnum': pnum, 'bsize': bsize, 'chunk_name': chunk_name},
+                          context=context)
+
                 futs.append(executor.submit(
                     run_upload, manager, location, part, context))
                 plist.append(part)
@@ -1196,7 +1195,17 @@ class BaseStore(driver.Store):
 
         # Wait until all futures are complete
         for fut in futures.as_completed(futs):
-            pass
+            fut_result = fut.result()
+            if fut_result:
+                msg = (
+                "Wrote chunk %(chunk_name)s with id %(chunk_id)d of length "
+                "%(bytes_read)d to Swift returning MD5 of content: %(chunk_etag)s" % {
+                    'chunk_name': fut_result[1],
+                    'chunk_id': fut_result[2],
+                    'bytes_read': fut_result[3],
+                    'chunk_etag': fut_result[0]}
+                    )
+                LOG.debug(msg, context=context)
 
         return total_size, plist
 

@@ -1175,7 +1175,8 @@ class SwiftTests(object):
         conn = self.store.get_connection(loc.store_location)
         conn.delete_object = fake_delete_object
         conn.head_object = fake_head_object
-        conn.get_container = fake_get_container        conn.post_account = fake_post_account
+        conn.get_container = fake_get_container
+        conn.post_account = fake_post_account
 
         global SWIFT_DELETE_OBJECT_CALLS
         SWIFT_DELETE_OBJECT_CALLS = 0
