@@ -28,10 +28,13 @@ from oslo_utils import units
 import six
 from six.moves import http_client
 from six.moves import urllib
+from six.moves.urllib.parse import quote
 try:
     import swiftclient
+    from swiftclient.utils import parse_api_response
 except ImportError:
     swiftclient = None
+from time import sleep
 
 import glance_store
 from glance_store._drivers.swift import buffered
@@ -50,7 +53,8 @@ LOG = logging.getLogger(__name__)
 DEFAULT_CONTAINER = 'glance'
 DEFAULT_LARGE_OBJECT_SIZE = 5 * units.Ki  # 5GB
 DEFAULT_LARGE_OBJECT_CHUNK_SIZE = 200  # 200M
-DEFAULT_THREAD_POOL_SIZE = 1 
+DEFAULT_THREAD_POOL_SIZE = 1
+DEFAULT_CONTAINER_DELETE_ATTEMPTS = 5  # how many times retry deletion
 ONE_MB = units.k * units.Ki  # Here we used the mixed meaning of MB
 
 _SWIFT_OPTS = [
@@ -433,6 +437,18 @@ Possible values:
     * Zero
     * Positive integer value
 
+Related Options:
+    * None
+
+"""),
+    cfg.IntOpt('swift_container_delete_timeout',
+               min=1,
+               default=1,
+               help="""
+Time in seconds defining the size of the window in which a new
+delete attempt may be requested.
+Possible values:
+    * Positive integer value
 Related Options:
     * None
 
@@ -874,6 +890,8 @@ class BaseStore(driver.Store):
         self.region = glance_conf.swift_store_region
         self.service_type = glance_conf.swift_store_service_type
         self.conf_endpoint = glance_conf.swift_store_endpoint
+        self.container_delete_timeout = \
+            glance_conf.swift_container_delete_timeout
         self.endpoint_type = glance_conf.swift_store_endpoint_type
         self.insecure = glance_conf.swift_store_auth_insecure
         self.ssl_compression = glance_conf.swift_store_ssl_compression
@@ -970,16 +988,61 @@ class BaseStore(driver.Store):
                                                    reason=reason)
         return result
 
-    def _delete_stale_chunks(self, connection, container, chunk_list):
-        for chunk in chunk_list:
-            LOG.debug("Deleting chunk %s" % chunk.name)
+    def _delete_chunks_sequential(self, connection, container, chunk_list):
+        for chunk_name in chunk_list:
+            LOG.debug("Deleting chunk %s" % chunk_name)
             try:
-                connection.delete_object(container, chunk.name)
+                connection.delete_object(container, chunk_name)
             except Exception:
                 msg = _("Failed to delete orphaned chunk "
                         "%(container)s/%(chunk)s")
                 LOG.exception(msg % {'container': container,
-                                     'chunk': chunk.name})
+                                     'chunk': chunk_name})
+
+    def _delete_chunks(self, connection, container, chunk_list):
+        LOG.debug(
+            "Deleting %(num_chunks)s chunks "
+            "from container %(container_name)s" % {
+                "num_chunks": len(chunk_list),
+                "container_name": container
+            }
+        )
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'text/plain',
+        }
+        objects = [
+            quote(('/%s/%s' % (container, chunk)).encode('utf-8'))
+            for chunk in chunk_list
+        ]
+        request_body = b''.join(
+            obj.encode('utf-8') + b'\n' for obj in objects)
+        try:
+            resp, body = connection.post_account(
+                headers=headers,
+                query_string='bulk-delete',
+                data=request_body,
+            )
+        except swiftclient.ClientException as e:
+            if e.http_status == http_client.NOT_FOUND:
+                # segement already deleted, that is OK.
+                pass
+            else:
+                msg = _('Unable to bulk_delete object. Error: %(error)s')
+                msg = msg % {'error': e}
+                LOG.exception(msg)
+        if not body:
+            msg = _('No content received on account POST. '
+                    'Is the bulk operations middleware enabled?')
+            LOG.exception(msg)
+            LOG.debug("Try to delete chunks in a sequential way as a fallback.")
+            self._delete_chunks_sequential(connection, container, chunk_list)
+            LOG.debug("Done sequential delete of chunks.")
+        else:
+            LOG.debug(
+                "Done bulk delete of chunks with response: %s" %
+                parse_api_response(headers, body)
+            )
 
     @driver.back_compat_add
     @capabilities.check
@@ -1049,10 +1112,11 @@ class BaseStore(driver.Store):
                             LOG.error(_("Error during chunked upload "
                                         "to backend, deleting stale "
                                         "chunks."))
-                            self._delete_stale_chunks(
+                            chunk_names = [chunk.name for chunk in plist]
+                            self._delete_chunks(
                                 manager.get_connection(),
                                 location.container,
-                                plist)
+                                chunk_names)
 
                     # In the case we have been given an unknown image size,
                     # set the size to the total size of the combined chunks.
@@ -1137,7 +1201,7 @@ class BaseStore(driver.Store):
             pass
 
         return total_size, plist
-        
+
     @capabilities.check
     def delete(self, location, connection=None, context=None):
         location = location.store_location
@@ -1172,18 +1236,8 @@ class BaseStore(driver.Store):
                 obj_container, obj_prefix = dlo_manifest.split('/', 1)
                 segments = connection.get_container(
                     obj_container, prefix=obj_prefix)[1]
-                for segment in segments:
-                    # TODO(jaypipes): This would be an easy area to parallelize
-                    # since we're simply sending off parallelizable requests
-                    # to Swift to delete stuff. It's not like we're going to
-                    # be hogging up network or file I/O here...
-                    try:
-                        connection.delete_object(obj_container,
-                                                 segment['name'])
-                    except swiftclient.ClientException:
-                        msg = _('Unable to delete segment %(segment_name)s')
-                        msg = msg % {'segment_name': segment['name']}
-                        LOG.exception(msg)
+                chunk_names = [chunk["name"] for chunk in segments]
+                self._delete_chunks(connection, obj_container, chunk_names)
 
             # Delete object (or, in segmented case, the manifest)
             connection.delete_object(location.container, location.obj)
@@ -1566,6 +1620,23 @@ class MultiTenantStore(BaseStore):
         super(MultiTenantStore, self).delete(location, connection)
         connection.delete_container(location.store_location.container)
 
+        delete_attempt = 0
+        while delete_attempt < DEFAULT_CONTAINER_DELETE_ATTEMPTS:
+            delete_attempt += 1
+            try:
+                connection.delete_container(location.store_location.container)
+                break
+            except swiftclient.ClientException as e:
+                if e.http_status == http_client.NOT_FOUND:
+                    # container is deleted, exit the loop
+                    break
+                elif (e.http_status == http_client.CONFLICT and
+                          delete_attempt != DEFAULT_CONTAINER_DELETE_ATTEMPTS):
+                    # wait, as the image segments might still be removing
+                    sleep(self.container_delete_timeout)
+                else:
+                    raise
+                
     def set_acls(self, location, public=False, read_tenants=None,
                  write_tenants=None, connection=None, context=None):
         location = location.store_location
