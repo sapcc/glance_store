@@ -756,7 +756,7 @@ class SwiftTests(object):
             self.store.large_object_size = orig_max_size
 
         # Confirm verifier update called expected number of times
-        self.assertEqual(2 * swift_size / custom_size,
+        self.assertEqual(swift_size / custom_size,
                          verifier.update.call_count)
 
         # define one chunk of the contents
@@ -764,15 +764,11 @@ class SwiftTests(object):
 
         # confirm all expected calls to update have occurred
         calls = [mock.call(swift_contents_piece),
-                 mock.call(b''),
                  mock.call(swift_contents_piece),
-                 mock.call(b''),
                  mock.call(swift_contents_piece),
-                 mock.call(b''),
                  mock.call(swift_contents_piece),
-                 mock.call(b''),
                  mock.call(swift_contents_piece),
-                 mock.call(b'')]
+                 mock.call(swift_contents_piece)]
         verifier.update.assert_has_calls(calls)
 
     @mock.patch('glance_store._drivers.swift.utils'
