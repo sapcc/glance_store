@@ -1640,7 +1640,16 @@ class MultiTenantStore(BaseStore):
                           delete_attempt != DEFAULT_CONTAINER_DELETE_ATTEMPTS):
                     # wait, as the image segments might still be removing
                     sleep(self.container_delete_timeout)
+                elif (e.http_status == http_client.INTERNAL_SERVER_ERROR and
+                          delete_attempt != DEFAULT_CONTAINER_DELETE_ATTEMPTS):
+                    LOG.debug("Something went wrong, retrying!!!")
+                    continue
                 else:
+                    msg = (_(u"Error while deleting the image, "
+                              "Please try again.\n"
+                              "Got error from Swift: %s.")
+                           % encodeutils.exception_to_unicode(e))
+                    LOG.error(msg)
                     raise
 
     def set_acls(self, location, public=False, read_tenants=None,
