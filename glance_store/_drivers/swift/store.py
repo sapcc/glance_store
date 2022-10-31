@@ -15,9 +15,12 @@
 
 """Storage backend for SWIFT"""
 
+import io
 import logging
 import math
+import os
 
+from concurrent import futures
 from keystoneauth1.access import service_catalog as keystone_sc
 from keystoneauth1 import identity as ks_identity
 from keystoneauth1 import session as ks_session
@@ -29,6 +32,7 @@ from oslo_utils import units
 import six
 from six.moves import http_client
 from six.moves import urllib
+
 try:
     import swiftclient
 except ImportError:
@@ -51,6 +55,7 @@ LOG = logging.getLogger(__name__)
 DEFAULT_CONTAINER = 'glance'
 DEFAULT_LARGE_OBJECT_SIZE = 5 * units.Ki  # 5GB
 DEFAULT_LARGE_OBJECT_CHUNK_SIZE = 200  # 200M
+DEFAULT_THREAD_POOL_SIZE = 0  # No threads
 ONE_MB = units.k * units.Ki  # Here we used the mixed meaning of MB
 
 _SWIFT_OPTS = [
@@ -474,7 +479,66 @@ Related options:
     * swift_upload_buffer_dir
 
 """),
+    cfg.IntOpt('swift_store_thread_pool_size',
+               default=DEFAULT_THREAD_POOL_SIZE,
+               min=DEFAULT_THREAD_POOL_SIZE,
+               max=os.cpu_count(),
+               help="""
+The number of threads in the pool to perform a multichunk upload in Swift.
+
+This configuration option takes the number of threads in the pool when
+performing a Multichunk Upload. The default value i.e. 0 indicates that
+chunks should be uploaded sequentially and any positive value upto no
+of cpus in system indicates number of green threads used to upload
+parellelly.
+
+NOTES:
+When enabling this option, user should not enable buffered upload option
+i.e. ``swift_buffer_on_upload`` since parallel upload is intended for
+reducing upload time and might not work well with buffered upload.
+
+Possible values:
+    * Any positive integer value
+
+"""),
 ]
+
+
+class UploadChunk(object):
+    """The class for the upload chunk."""
+    def __init__(self, fp, chunk_num, chunk_size):
+        self.fp = fp
+        self.chunk_num = chunk_num
+        self.chunk_size = chunk_size
+        self.chunk_name = None
+        self.success = True
+
+
+def run_upload(manager, location, chunk):
+    chunk_num = chunk.chunk_num
+    chunk_size = chunk.chunk_size
+    chunk_name = "%s-%05d" % (location.obj, chunk_num)
+    try:
+        chunk_etag = \
+            manager.get_connection().put_object(
+                location.container, chunk_name, chunk.fp,
+                content_length=chunk_size)
+        chunk.chunk_name = chunk_name
+    except Exception:
+        LOG.error(_("Error during chunked upload to backend, deleting stale "
+                    "chunks."))
+        chunk.success = False
+    finally:
+        chunk.fp.close()
+    if chunk.success:
+        msg = (
+            "Wrote chunk %(chunk_name)s with id %(chunk_id)d of length "
+            "%(bytes_read)d to Swift returning MD5 of content: %(chunk_etag)s"
+            % {'chunk_name': chunk_name,
+               'chunk_id': chunk_num,
+               'bytes_read': chunk_size,
+               'chunk_etag': chunk_etag})
+        LOG.debug(msg)
 
 
 def swift_retry_iter(resp_iter, length, store, location, manager):
@@ -799,6 +863,8 @@ class BaseStore(driver.Store):
         self.large_object_size = _obj_size * ONE_MB
         _chunk_size = self._option_get('swift_store_large_object_chunk_size')
         self.large_object_chunk_size = _chunk_size * ONE_MB
+        self.swift_store_thread_pool_size = self._option_get(
+            'swift_store_thread_pool_size')
         self.admin_tenants = glance_conf.swift_store_admin_tenants
         self.region = glance_conf.swift_store_region
         self.service_type = glance_conf.swift_store_service_type
@@ -813,6 +879,18 @@ class BaseStore(driver.Store):
             self.ks_verify = self.cacert or True
         if swiftclient is None:
             msg = _("Missing dependency python_swiftclient.")
+            raise exceptions.BadStoreConfiguration(store_name="swift",
+                                                   reason=msg)
+
+        # SET buffer to FALSE and parallel to TRUE
+        glance_conf.swift_buffer_on_upload = False
+        self.swift_store_thread_pool_size = 10
+
+        if ((glance_conf.swift_buffer_on_upload or
+                glance_conf.swift_upload_buffer_dir) and
+                self.swift_store_thread_pool_size):
+            msg = _("Positive value of swift_store_thread_pool_size i.e. "
+                    "parallel upload is not suppored with buffered upload.")
             raise exceptions.BadStoreConfiguration(store_name="swift",
                                                    reason=msg)
 
@@ -901,14 +979,16 @@ class BaseStore(driver.Store):
 
     def _delete_stale_chunks(self, connection, container, chunk_list):
         for chunk in chunk_list:
-            LOG.debug("Deleting chunk %s" % chunk)
+            if not chunk.success:
+                continue
+            LOG.debug("Deleting chunk %s" % chunk.chunk_name)
             try:
-                connection.delete_object(container, chunk)
+                connection.delete_object(container, chunk.chunk_name)
             except Exception:
                 msg = _("Failed to delete orphaned chunk "
                         "%(container)s/%(chunk)s")
                 LOG.exception(msg % {'container': container,
-                                     'chunk': chunk})
+                                     'chunk': chunk.chunk_name})
 
     @driver.back_compat_add
     @capabilities.check
@@ -945,10 +1025,10 @@ class BaseStore(driver.Store):
             LOG.debug("Adding image object '%(obj_name)s' "
                       "to Swift" % dict(obj_name=location.obj))
             try:
+                checksum = gutils.get_hasher('md5', False)
                 if not need_chunks:
                     # Image size is known, and is less than large_object_size.
                     # Send to Swift with regular PUT.
-                    checksum = gutils.get_hasher('md5', False)
                     reader = ChunkReader(image_file, checksum,
                                          os_hash_value, image_size,
                                          verifier=verifier)
@@ -957,83 +1037,29 @@ class BaseStore(driver.Store):
                         reader, content_length=image_size)
                 else:
                     # Write the image into Swift in chunks.
-                    chunk_id = 1
-                    if image_size > 0:
-                        total_chunks = str(int(
-                            math.ceil(float(image_size) /
-                                      float(self.large_object_chunk_size))))
+                    if self.swift_store_thread_pool_size:
+                        total_size, chunk_list = self._upload_chunks_parallel(
+                            image_file, checksum, os_hash_value, manager,
+                            location, verifier)
                     else:
-                        # image_size == 0 is when we don't know the size
-                        # of the image. This can occur with older clients
-                        # that don't inspect the payload size.
-                        LOG.debug("Cannot determine image size because it is "
-                                  "either not provided in the request or "
-                                  "chunked-transfer encoding is used. "
-                                  "Adding image as a segmented object to "
-                                  "Swift.")
-                        total_chunks = '?'
+                        total_size, chunk_list = self._upload_chunks(
+                            image_file, image_size, checksum, os_hash_value,
+                            manager, location, verifier)
+                    if not all([chunk.success for chunk in chunk_list]):
+                        # Delete orphaned segments from swift backend
+                        with excutils.save_and_reraise_exception():
+                            LOG.error(_("Error during chunked upload "
+                                        "to backend, deleting stale "
+                                        "chunks."))
+                            self._delete_stale_chunks(
+                                manager.get_connection(),
+                                location.container,
+                                chunk_list)
 
-                    checksum = gutils.get_hasher('md5', False)
-                    written_chunks = []
-                    combined_chunks_size = 0
-                    while True:
-                        chunk_size = self.large_object_chunk_size
-                        if image_size == 0:
-                            content_length = None
-                        else:
-                            left = image_size - combined_chunks_size
-                            if left == 0:
-                                break
-                            if chunk_size > left:
-                                chunk_size = left
-                            content_length = chunk_size
-
-                        chunk_name = "%s-%05d" % (location.obj, chunk_id)
-
-                        with self.reader_class(
-                                image_file, checksum, os_hash_value,
-                                chunk_size, verifier,
-                                backend_group=self.backend_group) as reader:
-                            if reader.is_zero_size is True:
-                                LOG.debug('Not writing zero-length chunk.')
-                                break
-
-                            try:
-                                chunk_etag = \
-                                    manager.get_connection().put_object(
-                                        location.container,
-                                        chunk_name, reader,
-                                        content_length=content_length)
-                                written_chunks.append(chunk_name)
-                            except Exception:
-                                # Delete orphaned segments from swift backend
-                                with excutils.save_and_reraise_exception():
-                                    LOG.error(_("Error during chunked upload "
-                                                "to backend, deleting stale "
-                                                "chunks."))
-                                    self._delete_stale_chunks(
-                                        manager.get_connection(),
-                                        location.container,
-                                        written_chunks)
-
-                            bytes_read = reader.bytes_read
-                            msg = ("Wrote chunk %(chunk_name)s (%(chunk_id)d/"
-                                   "%(total_chunks)s) of length %(bytes_read)"
-                                   "d to Swift returning MD5 of content: "
-                                   "%(chunk_etag)s" %
-                                   {'chunk_name': chunk_name,
-                                    'chunk_id': chunk_id,
-                                    'total_chunks': total_chunks,
-                                    'bytes_read': bytes_read,
-                                    'chunk_etag': chunk_etag})
-                            LOG.debug(msg)
-
-                        chunk_id += 1
-                        combined_chunks_size += bytes_read
                     # In the case we have been given an unknown image size,
                     # set the size to the total size of the combined chunks.
                     if image_size == 0:
-                        image_size = combined_chunks_size
+                        image_size = total_size
 
                     # Now we write the object manifest in X-Object-Manifest
                     # header as defined for Dynamic Large Objects (DLO) Mode.
@@ -1083,6 +1109,104 @@ class BaseStore(driver.Store):
                        % encodeutils.exception_to_unicode(e))
                 LOG.error(msg)
                 raise glance_store.BackendException(msg)
+
+    def _upload_chunks_parallel(self, image_file, checksum, os_hash_value,
+                                manager, location, verifier):
+        chunk_id = 0
+        total_size = 0
+        chunk_list = []
+
+        it = gutils.chunkreadable(image_file, self.large_object_chunk_size)
+        workers = self.swift_store_thread_pool_size
+        futs = []
+        with futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            for write_chunk in it:
+                os_hash_value.update(write_chunk)
+                checksum.update(write_chunk)
+                if verifier:
+                    verifier.update(write_chunk)
+                fp = io.BytesIO(write_chunk)
+                fp.seek(0)
+                chunk_size = len(write_chunk)
+                chunk = UploadChunk(fp, chunk_id + 1, chunk_size)
+                futs.append(executor.submit(
+                    run_upload, manager, location, chunk))
+                chunk_list.append(chunk)
+                total_size += chunk_size
+                chunk_id += 1
+
+        # Wait until all futures are complete
+        for fut in futures.as_completed(futs):
+            pass
+
+        return total_size, chunk_list
+
+    def _upload_chunks(self, image_file, image_size, checksum, os_hash_value,
+                       manager, location, verifier):
+        if image_size > 0:
+            total_chunks = str(int(
+                math.ceil(float(image_size) /
+                          float(self.large_object_chunk_size))))
+        else:
+            # image_size == 0 is when we don't know the size
+            # of the image. This can occur with older clients
+            # that don't inspect the payload size.
+            LOG.debug("Cannot determine image size because it is either not "
+                      "provided in the request or chunked-transfer encoding "
+                      "is used. Adding image as a segmented object to Swift.")
+            total_chunks = '?'
+
+        chunk_list = []
+        chunk_id = 1
+        total_size = 0
+        while True:
+            chunk_size = self.large_object_chunk_size
+            if image_size == 0:
+                content_length = None
+            else:
+                left = image_size - total_size
+                if left == 0:
+                    break
+                if chunk_size > left:
+                    chunk_size = left
+                content_length = chunk_size
+
+            chunk_name = "%s-%05d" % (location.obj, chunk_id)
+            chunk = UploadChunk(None, chunk_id, content_length)
+            chunk.chunk_name = chunk_name
+            with self.reader_class(
+                    image_file, checksum, os_hash_value, chunk_size,
+                    verifier, backend_group=self.backend_group) as reader:
+                if reader.is_zero_size is True:
+                    LOG.debug('Not writing zero-length chunk.')
+                    break
+                try:
+                    chunk_etag = \
+                        manager.get_connection().put_object(
+                            location.container,
+                            chunk_name, reader,
+                            content_length=content_length)
+                except Exception:
+                    chunk.success = False
+                    chunk_list.append(chunk)
+                    break
+
+                bytes_read = reader.bytes_read
+                msg = ("Wrote chunk %(chunk_name)s  (%(chunk_id)d/"
+                       "%(total_chunks)s) of length %(bytes_read)d to Swift "
+                       "returning MD5 of content: %(chunk_etag)s" %
+                       {'chunk_name': chunk_name,
+                        'chunk_id': chunk_id,
+                        'total_chunks': total_chunks,
+                        'bytes_read': bytes_read,
+                        'chunk_etag': chunk_etag})
+                LOG.debug(msg)
+
+            chunk_list.append(chunk)
+            total_size += bytes_read
+            chunk_id += 1
+
+        return total_size, chunk_list
 
     @capabilities.check
     def delete(self, location, connection=None, context=None):
