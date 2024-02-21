@@ -1501,7 +1501,7 @@ class MultiTenantStore(BaseStore):
 
         return self.storage_url
 
-    def delete(self, location, connection=None, context=None, max_retries=3, retry_delay=5):
+    def delete(self, location, connection=None, context=None, max_retries=20, retry_delay=0.5):
         if not connection:
             connection = self.get_connection(location.store_location, context=context)
 
