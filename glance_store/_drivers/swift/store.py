@@ -1511,7 +1511,7 @@ class MultiTenantStore(BaseStore):
                 connection.delete_container(location.store_location.container)
                 # Deletion successful, break out of the retry loop
                 break
-            except Exception as e:
+            except swiftclient.ClientException as e:
                 # Log the exception or perform error handling if needed
                 LOG.warning(f"Deletion attempt {attempt} failed. Exception: {str(e)}")
 
