@@ -24,10 +24,11 @@ import os
 import stat
 import urllib
 
+from concurrent import futures
+import futurist
 import jsonschema
 from oslo_config import cfg
 from oslo_serialization import jsonutils
-from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import units
 
@@ -70,6 +71,14 @@ Related options:
 
 """),
     cfg.MultiStrOpt('filesystem_store_datadirs',
+                    deprecated_for_removal=True,
+                    deprecated_since='Flamingo',
+                    deprecated_reason="""
+Users willing to use multiple data directories should configure multiple
+filesystem stores instead of using filesystem_store_datadirs.
+
+This option is scheduled for removal in the H development cycle.
+""",
                     help="""
 List of directories and their priorities to which the filesystem
 backend store writes images.
@@ -188,6 +197,69 @@ Related options:
     * None
 
 """),
+    cfg.IntOpt('filesystem_store_timeout',
+               default=0,
+               min=0,
+               help="""
+Timeout for all filesystem operations (seconds).
+
+Set to 0 to disable timeout protection (blocking IO, normal behavior).
+Set > 0 to enable timeout protection with thread pool.
+Recommended: 30 seconds for network storage, higher for slow networks.
+
+When timeout protection is enabled, filesystem operations like delete(),
+get_size(), and _get_capacity_info() will be wrapped with timeout
+protection. If an operation exceeds the timeout, a TimeoutError will be
+raised.
+
+Possible values:
+    * 0 (disabled, blocking IO)
+    * Any positive integer (timeout in seconds)
+
+Related options:
+    * filesystem_store_thread_pool_size
+    * filesystem_store_threadpool_threshold
+
+"""),
+    cfg.IntOpt('filesystem_store_thread_pool_size',
+               default=10,
+               min=1,
+               help="""
+Thread pool size for timeout-protected operations.
+
+Only meaningful when filesystem_store_timeout > 0.
+Ignored when filesystem_store_timeout = 0 (no thread pool is created).
+Each store instance gets its own pool to avoid starvation.
+Set based on expected concurrency and WSGI worker count.
+
+Possible values:
+    * Any positive integer
+
+Related options:
+    * filesystem_store_timeout
+    * filesystem_store_threadpool_threshold
+
+"""),
+    cfg.IntOpt('filesystem_store_threadpool_threshold',
+               default=75,
+               min=0,
+               max=100,
+               help="""
+Thread pool usage threshold for warning logs (percentage).
+
+Only meaningful when filesystem_store_timeout > 0.
+Ignored when filesystem_store_timeout = 0 (no thread pool is created).
+When thread pool usage exceeds this threshold, a warning is logged
+indicating that the pool is getting busy and may start blocking.
+
+Possible values:
+    * 0-100 (percentage)
+
+Related options:
+    * filesystem_store_timeout
+    * filesystem_store_thread_pool_size
+
+"""),
 ]
 
 MULTI_FILESYSTEM_METADATA_SCHEMA = {
@@ -277,6 +349,41 @@ class ChunkedFile(object):
             self.fp = None
 
 
+class TimeoutExecutor(object):
+    def __init__(self, timeout, pool_size, threshold):
+        self.timeout = timeout
+        self.pool_size = pool_size
+        self.threshold = threshold
+        self.active_futures = set()
+        if timeout > 0:
+            self.executor = futures.ThreadPoolExecutor(max_workers=pool_size)
+        else:
+            self.executor = futurist.SynchronousExecutor()
+
+    def execute(self, func, *args, **kwargs):
+        future = self.executor.submit(func, *args, **kwargs)
+        if not future.done():
+            self.active_futures.add(future)
+            # Check usage AFTER adding the current future
+            active = len([f for f in self.active_futures if not f.done()])
+            usage = (active / self.pool_size) * 100
+            if usage >= self.threshold:
+                LOG.warning(_LW("Thread pool usage is at %(usage).1f%% "
+                                "(threshold: %(threshold)d%%). Pool may "
+                                "start blocking.") %
+                            {'usage': usage,
+                             'threshold': self.threshold})
+        try:
+            return future.result(timeout=self.timeout)
+        except futures.TimeoutError:
+            raise exceptions.TimeoutError(timeout=self.timeout)
+        finally:
+            self.active_futures.discard(future)
+
+    def shutdown(self, wait=True):
+        self.executor.shutdown(wait=wait)
+
+
 class Store(glance_store.driver.Store):
 
     _CAPABILITIES = (capabilities.BitMasks.READ_RANDOM |
@@ -284,6 +391,15 @@ class Store(glance_store.driver.Store):
                      capabilities.BitMasks.DRIVER_REUSABLE)
     OPTIONS = _FILESYSTEM_CONFIGS
     FILESYSTEM_STORE_METADATA = None
+
+    def __init__(self, *args, **kargs):
+        super(Store, self).__init__(*args, **kargs)
+        if self.backend_group:
+            self.store_conf = glance_store.driver.BackendGroupConfiguration(
+                self.OPTIONS, self.backend_group, conf=self.conf)
+        else:
+            self.store_conf = self.conf.glance_store
+        self.timeout_executor = None
 
     def get_schemes(self):
         return ('file', 'filesystem')
@@ -311,11 +427,7 @@ class Store(glance_store.driver.Store):
         :datadir is a directory path in which glance writes image files.
         """
 
-        if self.backend_group:
-            fstore_perm = getattr(
-                self.conf, self.backend_group).filesystem_store_file_perm
-        else:
-            fstore_perm = self.conf.glance_store.filesystem_store_file_perm
+        fstore_perm = self.store_conf.filesystem_store_file_perm
 
         if fstore_perm <= 0:
             return
@@ -396,20 +508,18 @@ class Store(glance_store.driver.Store):
             self.FILESYSTEM_STORE_METADATA = metadata
         except (jsonschema.exceptions.ValidationError,
                 exceptions.BackendException, ValueError) as vee:
-            err_msg = encodeutils.exception_to_unicode(vee)
             reason = _('The JSON in the metadata file %(file)s is '
                        'not valid and it can not be used: '
                        '%(vee)s.') % dict(file=metadata_file,
-                                          vee=err_msg)
+                                          vee=vee)
             LOG.error(reason)
             raise exceptions.BadStoreConfiguration(
                 store_name="filesystem", reason=reason)
         except IOError as ioe:
-            err_msg = encodeutils.exception_to_unicode(ioe)
             reason = _('The path for the metadata file %(file)s could '
                        'not be accessed: '
                        '%(ioe)s.') % dict(file=metadata_file,
-                                          ioe=err_msg)
+                                          ioe=ioe)
             LOG.error(reason)
             raise exceptions.BadStoreConfiguration(
                 store_name="filesystem", reason=reason)
@@ -421,21 +531,21 @@ class Store(glance_store.driver.Store):
         this method. If the store was not able to successfully configure
         itself, it should raise `exceptions.BadStoreConfiguration`
         """
-        if self.backend_group:
-            store_conf = getattr(self.conf, self.backend_group)
-        else:
-            store_conf = self.conf.glance_store
+        fdir = self.store_conf.filesystem_store_datadir
+        fdirs = self.store_conf.filesystem_store_datadirs
+        fstore_perm = self.store_conf.filesystem_store_file_perm
+        meta_file = self.store_conf.filesystem_store_metadata_file
 
-        fdir = store_conf.filesystem_store_datadir
-        fdirs = store_conf.filesystem_store_datadirs
-        fstore_perm = store_conf.filesystem_store_file_perm
-        meta_file = store_conf.filesystem_store_metadata_file
-
-        self.thin_provisioning = store_conf.\
+        self.thin_provisioning = self.store_conf.\
             filesystem_thin_provisioning
-        self.chunk_size = store_conf.filesystem_store_chunk_size
+        self.chunk_size = self.store_conf.filesystem_store_chunk_size
         self.READ_CHUNKSIZE = self.chunk_size
         self.WRITE_CHUNKSIZE = self.READ_CHUNKSIZE
+
+        timeout = self.store_conf.filesystem_store_timeout
+        pool_size = self.store_conf.filesystem_store_thread_pool_size
+        threshold = self.store_conf.filesystem_store_threadpool_threshold
+        self.timeout_executor = TimeoutExecutor(timeout, pool_size, threshold)
 
         if not (fdir or fdirs):
             reason = (_("Specify at least 'filesystem_store_datadir' or "
@@ -552,14 +662,14 @@ class Store(glance_store.driver.Store):
 
         return datadir_path, priority
 
-    @staticmethod
-    def _resolve_location(location):
+    def _resolve_location(self, location):
         filepath = location.store_location.path
 
-        if not os.path.exists(filepath):
+        try:
+            filesize = self.timeout_executor.execute(os.path.getsize, filepath)
+        except FileNotFoundError:
             raise exceptions.NotFound(image=filepath)
 
-        filesize = os.path.getsize(filepath)
         return filepath, filesize
 
     def _get_metadata(self, filepath):
@@ -647,15 +757,14 @@ class Store(glance_store.driver.Store):
         """
         loc = location.store_location
         fn = loc.path
-        if os.path.exists(fn):
-            try:
-                LOG.debug(_("Deleting image at %(fn)s"), {'fn': fn})
-                os.unlink(fn)
-            except OSError:
-                raise exceptions.Forbidden(
-                    message=(_("You cannot delete file %s") % fn))
-        else:
+        try:
+            LOG.debug(_("Deleting image at %(fn)s"), {'fn': fn})
+            self.timeout_executor.execute(os.unlink, fn)
+        except FileNotFoundError:
             raise exceptions.NotFound(image=fn)
+        except OSError:
+            raise exceptions.Forbidden(
+                message=(_("You cannot delete file %s") % fn))
 
     def _get_capacity_info(self, mount_point):
         """Calculates total available space for given mount point.
@@ -664,7 +773,7 @@ class Store(glance_store.driver.Store):
         """
 
         # Calculate total available space
-        stvfs_result = os.statvfs(mount_point)
+        stvfs_result = self.timeout_executor.execute(os.statvfs, mount_point)
         total_available_space = stvfs_result.f_bavail * stvfs_result.f_bsize
         return max(0, total_available_space)
 
@@ -745,6 +854,14 @@ class Store(glance_store.driver.Store):
             with open(filepath, 'wb') as f:
                 for buf in utils.chunkreadable(image_file,
                                                self.WRITE_CHUNKSIZE):
+                    actual_to_write = bytes_written + len(buf)
+                    if image_size != 0 and actual_to_write > image_size:
+                        raise glance_store.Invalid(
+                            _("Size exceeds: expected "
+                              "%(expected)d "
+                              "bytes, got %(actual)d bytes") %
+                            {'expected': image_size,
+                             'actual': actual_to_write})
                     bytes_written += len(buf)
                     os_hash_value.update(buf)
                     checksum.update(buf)
@@ -766,6 +883,15 @@ class Store(glance_store.driver.Store):
             with excutils.save_and_reraise_exception():
                 self._delete_partial(filepath, image_id)
 
+        # Final size check after reading all chunks
+        if image_size != 0 and bytes_written != image_size:
+            # Cleanup and raise exception after write size mismatch
+            self._delete_partial(filepath, image_id)
+            message = (_("Size mismatch: expected %(expected)d bytes, "
+                         "got %(actual)d bytes") %
+                       {'expected': image_size, 'actual': bytes_written})
+            raise glance_store.Invalid(message=message)
+
         hash_hex = os_hash_value.hexdigest()
         checksum_hex = checksum.hexdigest()
         metadata = self._get_metadata(filepath)
@@ -777,11 +903,7 @@ class Store(glance_store.driver.Store):
                    'checksum_hex': checksum_hex,
                    'hash_hex': hash_hex})
 
-        if self.backend_group:
-            fstore_perm = getattr(
-                self.conf, self.backend_group).filesystem_store_file_perm
-        else:
-            fstore_perm = self.conf.glance_store.filesystem_store_file_perm
+        fstore_perm = self.store_conf.filesystem_store_file_perm
 
         if fstore_perm > 0:
             perm = int(str(fstore_perm), 8)
@@ -808,5 +930,4 @@ class Store(glance_store.driver.Store):
         except Exception as e:
             msg = _('Unable to remove partial image '
                     'data for image %(iid)s: %(e)s')
-            LOG.error(msg % dict(iid=iid,
-                                 e=encodeutils.exception_to_unicode(e)))
+            LOG.error(msg % dict(iid=iid, e=e))

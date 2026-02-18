@@ -15,6 +15,7 @@
 
 """Storage backend for S3 or Storage Servers that follow the S3 Protocol"""
 
+from concurrent import futures
 import io
 import logging
 import math
@@ -32,9 +33,7 @@ except ImportError:
     boto_exceptions = None
     boto_utils = None
 
-import eventlet
 from oslo_config import cfg
-from oslo_utils import encodeutils
 from oslo_utils import units
 
 import glance_store
@@ -180,6 +179,7 @@ Related Options:
 """),
     cfg.IntOpt('s3_store_large_object_size',
                default=DEFAULT_LARGE_OBJECT_SIZE,
+               min=0,
                help="""
 What size, in MB, should S3 start chunking image files and do a multipart
 upload in S3.
@@ -190,7 +190,7 @@ upload the image to S3 as is or to split it (Multipart Upload).
 Note: You can only split up to 10,000 images.
 
 Possible values:
-    * Any positive integer value
+    * Any positive integer value or zero
 
 Related Options:
     * s3_store_large_object_chunk_size
@@ -230,7 +230,83 @@ Related Options:
     * s3_store_large_object_size
     * s3_store_large_object_chunk_size
 
-""")
+"""),
+    cfg.StrOpt('s3_store_cacert',
+               default='',
+               help="""
+The path to the CA cert bundle to use. The default value (an empty string)
+forces the use of the default CA cert bundle used by botocore.
+
+Possible values:
+    * A path to the CA cert bundle to use
+    * An empty string to use the default CA cert bundle used by botocore
+
+"""),
+    cfg.BoolOpt('s3_store_enable_data_integrity_protection',
+                default=False,
+                help="""
+Turn on S3 data integrity protections by enabling request checksum calculation
+and response checksum validation. Setting this to False is the same as setting
+the AWS_REQUEST_CHECKSUM_CALCULATION and AWS_RESPONSE_CHECKSUM_VALIDATION
+environment variables to "when_required". Setting this to True gives the user
+fine-grained control over the data integrity protections by using the
+s3_store_request_checksum_calculation and s3_store_response_checksum_validation
+options.
+
+This defaults to False as to not change the default behaviour in glance_store,
+which prevents upload failures when using S3-compatible storage backends that
+do not implement S3 data integrity protection.
+
+Related Options:
+    * s3_store_request_checksum_calculation
+    * s3_store_response_checksum_validation
+"""),
+    cfg.StrOpt('s3_store_request_checksum_calculation',
+               default='when_required',
+               choices=['when_required', 'when_supported'],
+               help="""
+Controls when checksums are calculated for S3 upload requests.
+
+This configuration option provides fine-grained control over request checksum
+calculation behavior. It maps directly to the botocore Config parameter
+request_checksum_calculation.
+
+Possible values:
+    * when_required - Only calculate checksums when required by the operation
+    * when_supported - Calculate checksums when supported by the operation
+
+This option is only used when s3_store_enable_data_integrity_protection is
+set to True. When s3_store_enable_data_integrity_protection is False, both
+request and response checksums use 'when_required' regardless of this setting.
+
+Related Options:
+    * s3_store_response_checksum_validation
+    * s3_store_enable_data_integrity_protection
+
+"""),
+    cfg.StrOpt('s3_store_response_checksum_validation',
+               default='when_required',
+               choices=['when_required', 'when_supported'],
+               help="""
+Controls when checksums are validated for S3 download responses.
+
+This configuration option provides fine-grained control over response checksum
+validation behavior. It maps directly to the botocore Config parameter
+response_checksum_validation.
+
+Possible values:
+    * when_required - Only validate checksums when required by the operation
+    * when_supported - Validate checksums when supported by the operation
+
+This option is only used when s3_store_enable_data_integrity_protection is
+set to True. When s3_store_enable_data_integrity_protection is False, both
+request and response checksums use 'when_required' regardless of this setting.
+
+Related Options:
+    * s3_store_request_checksum_calculation
+    * s3_store_enable_data_integrity_protection
+
+"""),
 ]
 
 
@@ -454,7 +530,8 @@ class Store(glance_store.driver.Store):
 
     def _option_get(self, param):
         if self.backend_group:
-            store_conf = getattr(self.conf, self.backend_group)
+            store_conf = glance_store.driver.BackendGroupConfiguration(
+                self.OPTIONS, self.backend_group, conf=self.conf)
         else:
             store_conf = self.conf.glance_store
 
@@ -462,7 +539,17 @@ class Store(glance_store.driver.Store):
         if not result:
             if param == 's3_store_create_bucket_on_put':
                 return result
+            if param == 's3_store_large_object_size':
+                return result
             if param == 's3_store_region_name':
+                return result
+            if param == 's3_store_cacert':
+                return result
+            if param == 's3_store_enable_data_integrity_protection':
+                return result
+            if param == 's3_store_request_checksum_calculation':
+                return result
+            if param == 's3_store_response_checksum_validation':
                 return result
             reason = _("Could not find %s in configuration options.") % param
             LOG.error(reason)
@@ -483,7 +570,41 @@ class Store(glance_store.driver.Store):
 
         session = boto_session.Session(aws_access_key_id=loc.accesskey,
                                        aws_secret_access_key=loc.secretkey)
-        config = boto_client.Config(s3=calling_format)
+
+        # Determine checksum settings with precedence:
+        # 1. If s3_store_enable_data_integrity_protection is False,
+        #    use 'when_required' for both (data integrity protection disabled)
+        # 2. If s3_store_enable_data_integrity_protection is True,
+        #    use the fine-grained option values (default: 'when_required')
+        if not self._option_get('s3_store_enable_data_integrity_protection'):
+            # Data integrity protection disabled, use when_required for both
+            request_checksum = 'when_required'
+            response_checksum = 'when_required'
+        else:
+            # Data integrity protection enabled, use fine-grained options
+            request_checksum = self._option_get(
+                's3_store_request_checksum_calculation')
+            response_checksum = self._option_get(
+                's3_store_response_checksum_validation')
+
+        # Try to create Config with checksum parameters (boto3 >= 1.36.0)
+        # Fall back to Config without them for older versions
+        # NOTE(croelandt): This try/except block should be removed and
+        # simplified to always pass the checksum parameters once we require
+        # boto3 >= 1.36.0 in requirements.txt
+        try:
+            config = boto_client.Config(
+                s3=calling_format,
+                request_checksum_calculation=request_checksum,
+                response_checksum_validation=response_checksum,
+            )
+        except TypeError:
+            # boto3 < 1.36.0 doesn't support these parameters
+            LOG.warning("boto3 version does not support checksum control "
+                        "parameters. Upgrade to boto3 >= 1.36.0 to use "
+                        "s3_store_enable_data_integrity_protection and "
+                        "fine-grained checksum options.")
+            config = boto_client.Config(s3=calling_format)
         location = get_s3_location(s3_host)
 
         bucket_name = loc.bucket
@@ -500,11 +621,14 @@ class Store(glance_store.driver.Store):
         else:
             endpoint_url = s3_host
 
-        return session.client(service_name='s3',
-                              endpoint_url=endpoint_url,
-                              region_name=region_name,
-                              use_ssl=(loc.scheme == 's3+https'),
-                              config=config)
+        store_cacert = self._option_get('s3_store_cacert')
+        return session.client(
+            service_name='s3',
+            endpoint_url=endpoint_url,
+            region_name=region_name,
+            use_ssl=(loc.scheme == 's3+https'),
+            verify=None if store_cacert == '' else store_cacert,
+            config=config)
 
     def _operation_set(self, loc):
         """Objects and variables frequently used when operating S3 are
@@ -632,7 +756,8 @@ class Store(glance_store.driver.Store):
                                             key=key,
                                             loc=loc,
                                             hashing_algo=hashing_algo,
-                                            verifier=verifier)
+                                            verifier=verifier,
+                                            image_size=image_size)
 
             return self._add_multipart(s3_client=s3_client,
                                        image_file=image_file,
@@ -647,7 +772,7 @@ class Store(glance_store.driver.Store):
         raise exceptions.Duplicate(image=key)
 
     def _add_singlepart(self, s3_client, image_file, bucket, key, loc,
-                        hashing_algo, verifier):
+                        hashing_algo, verifier, image_size):
         """Stores an image file with a single part upload to S3 backend.
 
         :param s3_client: An object with credentials to connect to S3
@@ -658,6 +783,8 @@ class Store(glance_store.driver.Store):
                     from glance_store.location.get_location_from_uri()
         :param hashing_algo: A hashlib algorithm identifier (string)
         :param verifier: An object used to verify signatures for images
+        :param image_size: The size of the image data to write,
+                           in bytes
         :returns: tuple of: (1) URL in backing store, (2) bytes written,
                   (3) checksum, (4) multihash value, and (5) a dictionary
                   with storage system specific information
@@ -665,14 +792,27 @@ class Store(glance_store.driver.Store):
         os_hash_value = utils.get_hasher(hashing_algo, False)
         checksum = utils.get_hasher('md5', False)
         image_data = b''
-        image_size = 0
+        total_bytes = 0
         for chunk in utils.chunkreadable(image_file, self.WRITE_CHUNKSIZE):
+            total_bytes += len(chunk)
+            if image_size != 0 and total_bytes > image_size:
+                # Size exceeded, abort upload
+                raise glance_store.Invalid(
+                    _("Size exceeds: expected %(expected)d bytes, "
+                      "got %(actual)d bytes") %
+                    {'expected': image_size, 'actual': total_bytes})
             image_data += chunk
-            image_size += len(chunk)
             os_hash_value.update(chunk)
             checksum.update(chunk)
             if verifier:
                 verifier.update(chunk)
+
+        # Final size check after reading all chunks
+        if image_size != 0 and total_bytes != image_size:
+            raise glance_store.Invalid(
+                _("Size mismatch: expected %(expected)d bytes, "
+                  "got %(actual)d bytes") %
+                {'expected': image_size, 'actual': total_bytes})
 
         s3_client.put_object(Body=image_data,
                              Bucket=bucket,
@@ -687,9 +827,9 @@ class Store(glance_store.driver.Store):
 
         LOG.debug("Wrote %(size)d bytes to S3 key named %(key)s "
                   "with checksum %(checksum)s",
-                  {'size': image_size, 'key': key, 'checksum': checksum_hex})
+                  {'size': total_bytes, 'key': key, 'checksum': checksum_hex})
 
-        return loc.get_uri(), image_size, checksum_hex, hash_hex, metadata
+        return loc.get_uri(), total_bytes, checksum_hex, hash_hex, metadata
 
     def _add_multipart(self, s3_client, image_file, image_size, bucket,
                        key, loc, hashing_algo, verifier):
@@ -710,91 +850,139 @@ class Store(glance_store.driver.Store):
         os_hash_value = utils.get_hasher(hashing_algo, False)
         checksum = utils.get_hasher('md5', False)
         pool_size = self.s3_store_thread_pools
-        pool = eventlet.greenpool.GreenPool(size=pool_size)
-        mpu = s3_client.create_multipart_upload(Bucket=bucket, Key=key)
-        upload_id = mpu['UploadId']
-        LOG.debug("Multipart initiate key=%(key)s, UploadId=%(UploadId)s",
-                  {'key': key, 'UploadId': upload_id})
-        cstart = 0
-        plist = []
+        # Replace eventlet.GreenPool with ThreadPoolExecutor
+        with futures.ThreadPoolExecutor(
+                max_workers=pool_size) as executor:
+            # Create a list to store the futures
+            futures_list = []
+            mpu = s3_client.create_multipart_upload(Bucket=bucket, Key=key)
+            upload_id = mpu['UploadId']
+            LOG.debug("Multipart initiate key=%(key)s, UploadId=%(UploadId)s",
+                      {'key': key, 'UploadId': upload_id})
+            cstart = 0
+            plist = []
 
-        chunk_size = int(math.ceil(float(image_size) / MAX_PART_NUM))
-        write_chunk_size = max(self.s3_store_large_object_chunk_size,
-                               chunk_size)
-        it = utils.chunkreadable(image_file, self.WRITE_CHUNKSIZE)
-        buffered_chunk = b''
-        while True:
-            try:
-                buffered_clen = len(buffered_chunk)
-                if buffered_clen < write_chunk_size:
-                    # keep reading data
-                    read_chunk = next(it)
-                    buffered_chunk += read_chunk
-                    continue
-                else:
-                    write_chunk = buffered_chunk[:write_chunk_size]
-                    remained_data = buffered_chunk[write_chunk_size:]
-                    os_hash_value.update(write_chunk)
-                    checksum.update(write_chunk)
-                    if verifier:
-                        verifier.update(write_chunk)
-                    fp = io.BytesIO(write_chunk)
-                    fp.seek(0)
-                    part = UploadPart(mpu, fp, cstart + 1, len(write_chunk))
-                    pool.spawn_n(run_upload, s3_client, bucket, key, part)
-                    plist.append(part)
-                    cstart += 1
-                    buffered_chunk = remained_data
-            except StopIteration:
-                if len(buffered_chunk) > 0:
-                    # Write the last chunk data
-                    write_chunk = buffered_chunk
-                    os_hash_value.update(write_chunk)
-                    checksum.update(write_chunk)
-                    if verifier:
-                        verifier.update(write_chunk)
-                    fp = io.BytesIO(write_chunk)
-                    fp.seek(0)
-                    part = UploadPart(mpu, fp, cstart + 1, len(write_chunk))
-                    pool.spawn_n(run_upload, s3_client, bucket, key, part)
-                    plist.append(part)
-                break
+            chunk_size = int(math.ceil(float(image_size) / MAX_PART_NUM))
+            write_chunk_size = max(self.s3_store_large_object_chunk_size,
+                                   chunk_size)
+            it = utils.chunkreadable(image_file, self.WRITE_CHUNKSIZE)
+            buffered_chunk = b''
+            total_bytes = 0
+            while True:
+                try:
+                    buffered_clen = len(buffered_chunk)
+                    if buffered_clen < write_chunk_size:
+                        # keep reading data
+                        read_chunk = next(it)
+                        buffered_chunk += read_chunk
+                        continue
+                    else:
+                        write_chunk = buffered_chunk[:write_chunk_size]
+                        remained_data = buffered_chunk[write_chunk_size:]
+                        total_bytes += len(write_chunk)
+                        if image_size != 0 and total_bytes > image_size:
+                            # Abort multipart upload immediately
+                            s3_client.abort_multipart_upload(
+                                Bucket=bucket, Key=key, UploadId=upload_id)
+                            raise glance_store.Invalid(
+                                _("Size exceeds: expected "
+                                  "%(expected)d "
+                                  "bytes, got %(actual)d bytes") %
+                                {'expected': image_size,
+                                 'actual': total_bytes})
+                        os_hash_value.update(write_chunk)
+                        checksum.update(write_chunk)
+                        if verifier:
+                            verifier.update(write_chunk)
+                        fp = io.BytesIO(write_chunk)
+                        fp.seek(0)
+                        part = UploadPart(
+                            mpu, fp, cstart + 1, len(write_chunk))
+                        # Spawn thread to upload part
+                        futures_list.append(executor.submit(
+                            run_upload, s3_client, bucket, key, part))
+                        plist.append(part)
+                        cstart += 1
+                        buffered_chunk = remained_data
+                except StopIteration:
+                    if len(buffered_chunk) > 0:
+                        # Write the last chunk data
+                        write_chunk = buffered_chunk
+                        total_bytes += len(write_chunk)
+                        os_hash_value.update(write_chunk)
+                        checksum.update(write_chunk)
+                        if verifier:
+                            verifier.update(write_chunk)
+                        fp = io.BytesIO(write_chunk)
+                        fp.seek(0)
+                        part = UploadPart(
+                            mpu, fp, cstart + 1, len(write_chunk))
+                        futures_list.append(executor.submit(
+                            run_upload, s3_client, bucket, key, part))
+                        plist.append(part)
+                    break
 
-        pedict = {}
-        total_size = 0
-        pool.waitall()
+        # Wait for all uploads to finish
+        futures.wait(futures_list)
 
-        for part in plist:
-            pedict.update(part.etag)
-            total_size += part.size
+        # Final size validation after all parts uploaded
+        if image_size != 0 and total_bytes != image_size:
+            # Abort upload if mismatch (redundant check)
+            s3_client.abort_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id)
+            raise glance_store.Invalid(
+                _("Size mismatch: expected %(expected)d "
+                  "bytes, got %(actual)d bytes") %
+                {'expected': image_size, 'actual': total_bytes})
 
-        success = True
-        for part in plist:
-            if not part.success:
-                success = False
+        # Check success status
+        success = all(p.success for p in plist)
+        total_size = sum(p.size for p in plist)
 
         if success:
-            # Complete
-            mpu_list = self._get_mpu_list(pedict)
-            s3_client.complete_multipart_upload(Bucket=bucket,
-                                                Key=key,
-                                                MultipartUpload=mpu_list,
-                                                UploadId=upload_id)
             hash_hex = os_hash_value.hexdigest()
             checksum_hex = checksum.hexdigest()
-
             # Add store backend information to location metadata
             metadata = {}
             if self.backend_group:
                 metadata['store'] = self.backend_group
+            # If no parts were uploaded, this was a zero-byte image. This is
+            # the case when a BFV server creates a snapshot resulting in a 0
+            # byte image file. Since we cannot complete a multipart upload
+            # with zero parts, so we must abort it and create the empty
+            # object directly.
+            if not plist:
+                LOG.info("Not doing multipart upload for zero-byte image "
+                         "key=%(key)s, UploadId=%(UploadId)s",
+                         {'key': key, 'UploadId': upload_id})
+                s3_client.abort_multipart_upload(Bucket=bucket, Key=key,
+                                                 UploadId=upload_id)
 
-            LOG.info("Multipart complete key=%(key)s "
-                     "UploadId=%(UploadId)s "
-                     "Wrote %(total_size)d bytes to S3 key "
-                     "named %(key)s "
-                     "with checksum %(checksum)s",
-                     {'key': key, 'UploadId': upload_id,
-                      'total_size': total_size, 'checksum': checksum_hex})
+                LOG.debug("Creating zero-byte object directly using "
+                          "singlepart for key=%s", key)
+                s3_client.put_object(Body=b'', Bucket=bucket, Key=key)
+                LOG.info("Singlepart upload completed. "
+                         "Wrote %(total_size)d bytes to S3 key "
+                         "named %(key)s "
+                         "with checksum %(checksum)s",
+                         {'key': key, 'total_size': total_size,
+                          'checksum': checksum_hex})
+            else:
+                # Complete the multipart upload
+                pedict = {p.partnum: p.etag[p.partnum] for p in plist}
+                mpu_list = self._get_mpu_list(pedict)
+                s3_client.complete_multipart_upload(Bucket=bucket,
+                                                    Key=key,
+                                                    MultipartUpload=mpu_list,
+                                                    UploadId=upload_id)
+
+                LOG.info("Multipart complete key=%(key)s "
+                         "UploadId=%(UploadId)s "
+                         "Wrote %(total_size)d bytes to S3 key "
+                         "named %(key)s "
+                         "with checksum %(checksum)s",
+                         {'key': key, 'UploadId': upload_id,
+                          'total_size': total_size, 'checksum': checksum_hex})
             return loc.get_uri(), total_size, checksum_hex, hash_hex, metadata
 
         # Abort
@@ -847,8 +1035,7 @@ class Store(glance_store.driver.Store):
             error_code = e.response['Error']['Code']
             if error_code == '404':
                 return False
-            msg = ("Failed to get bucket info: %s" %
-                   encodeutils.exception_to_unicode(e))
+            msg = "Failed to get bucket info: %s" % e
             LOG.error(msg)
             raise glance_store.BadStoreConfiguration(store_name='s3',
                                                      reason=msg)
@@ -872,8 +1059,7 @@ class Store(glance_store.driver.Store):
             error_code = e.response['Error']['Code']
             if error_code == '404':
                 return False
-            msg = ("Failed to get object info: %s" %
-                   encodeutils.exception_to_unicode(e))
+            msg = "Failed to get object info: %s" % e
             LOG.error(msg)
             raise glance_store.BadStoreConfiguration(store_name='s3',
                                                      reason=msg)
@@ -905,8 +1091,7 @@ class Store(glance_store.driver.Store):
                 }
             )
         except boto_exceptions.ClientError as e:
-            msg = ("Failed to add bucket to S3: %s" %
-                   encodeutils.exception_to_unicode(e))
+            msg = "Failed to add bucket to S3: %s" % e
             LOG.error(msg)
             raise glance_store.BadStoreConfiguration(store_name='s3',
                                                      reason=msg)

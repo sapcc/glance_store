@@ -39,7 +39,7 @@
     parent: tox
     abstract: true
     description: Abstract job for glance_store vs. cinder
-    nodeset: ubuntu-focal
+    nodeset: ubuntu-noble
     required-projects:
       - name: openstack/os-brick
       - name: openstack/python-cinderclient
@@ -57,7 +57,7 @@
     parent: tox
     abstract: true
     description: Abstract job for glance_store vs. keystone
-    nodeset: ubuntu-focal
+    nodeset: ubuntu-noble
     required-projects:
       - name: openstack/keystoneauth
       - name: openstack/python-keystoneclient
@@ -75,7 +75,7 @@
     parent: tox
     abstract: true
     description: Abstract job for glance_store vs. oslo
-    nodeset: ubuntu-focal
+    nodeset: ubuntu-noble
     required-projects:
       - name: openstack/oslo.concurrency
       - name: openstack/oslo.config
@@ -100,7 +100,7 @@
     parent: tox
     abstract: true
     description: Abstract job for glance_store vs. swift
-    nodeset: ubuntu-focal
+    nodeset: ubuntu-noble
     required-projects:
       - name: openstack/python-swiftclient
 
@@ -124,6 +124,11 @@
     timeout: 10800
     vars:
       tempest_test_regex: (^tempest\.(api|scenario)|(^cinder_tempest_plugin))
+      devstack_local_conf:
+        post-config:
+          $GLANCE_API_CONF:
+            DEFAULT:
+              do_secure_hash: False
 
 - job:
     name: cross-glance-tox-functional
@@ -136,6 +141,16 @@
     required-projects:
       - openstack/glance
       - openstack/glance_store
+    irrelevant-files:
+      - ^LICENSE$
+      - ^.*\.rst$
+      - ^test-requirements.txt$
+      - ^glance_store/locale/.*$
+      - ^glance_store/tests/.*$
+      - ^doc/.*$
+      - ^releasenotes/.*$
+      - ^tools/.*$
+      - ^tox.ini/.*$
 
 - project:
     templates:
@@ -148,13 +163,20 @@
       jobs:
         - cross-glance-tox-functional
         - glance_store-src-ceph-tempest:
-            irrelevant-files: &tempest-irrelevant-files
+            irrelevant-files:
               - ^doc/.*$
               - ^releasenotes/.*$
               - ^.*\.rst$
               - ^(test-|)requirements.txt$
               - ^setup.cfg$
               - ^tox.ini$
+              - ^glance_store/_drivers/cinder/.*$
+              - ^glance_store/_drivers/swift/.*$
+              - ^glance_store/_drivers/filesystem*$
+              - ^glance_store/_drivers/http.*$
+              - ^glance_store/_drivers/s3.*$
+              - ^glance_store/tests/.*$
+
     experimental:
       jobs:
         - glance_store-dsvm-functional-filesystem

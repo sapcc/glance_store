@@ -18,7 +18,6 @@ import hashlib
 import logging
 
 from oslo_config import cfg
-from oslo_utils import encodeutils
 from oslo_utils import units
 from stevedore import driver
 from stevedore import extension
@@ -331,6 +330,34 @@ def verify_store():
         raise RuntimeError(msg)
 
 
+def get_store_weight(store_identifier):
+    """Determine backing store weightage from identifier.
+
+    Given a store identifier, return the appropriate weight of store
+    from memory.
+    """
+    enabled_backends = CONF.enabled_backends
+    enabled_backends.update(_RESERVED_STORES)
+
+    try:
+        scheme = enabled_backends[store_identifier]
+    except KeyError:
+        msg = _("Store for identifier %s not found") % store_identifier
+        raise exceptions.UnknownScheme(msg)
+
+    try:
+        backend_map = location.SCHEME_TO_CLS_BACKEND_MAP[scheme]
+        scheme_info = backend_map[store_identifier]
+    except KeyError:
+        raise exceptions.UnknownScheme(scheme=scheme)
+
+    store = scheme_info['store']
+    if store:
+        return store.weight
+
+    return 0
+
+
 def get_store_from_store_identifier(store_identifier):
     """Determine backing store from identifier.
 
@@ -410,9 +437,9 @@ def _check_metadata(store, metadata):
     except exceptions.BackendException as e:
         e_msg = (_("A bad metadata structure was returned from the "
                    "%(driver)s storage driver: %(metadata)s.  %(e)s.") %
-                 dict(driver=encodeutils.exception_to_unicode(store),
-                      metadata=encodeutils.exception_to_unicode(metadata),
-                      e=encodeutils.exception_to_unicode(e)))
+                 dict(driver=store,
+                      metadata=metadata,
+                      e=e))
         LOG.error(e_msg)
         raise exceptions.BackendException(e_msg)
 

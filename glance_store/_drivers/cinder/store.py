@@ -34,7 +34,6 @@ from oslo_utils import units
 
 from glance_store._drivers.cinder import base
 from glance_store import capabilities
-from glance_store.common import attachment_state_manager
 from glance_store.common import cinder_utils
 from glance_store.common import utils
 import glance_store.driver
@@ -286,6 +285,55 @@ Related options:
     * cinder_store_project_name
     * cinder_store_project_domain_name
     * cinder_store_user_domain_name
+    * cinder_store_application_credential_id
+    * cinder_store_application_credential_secret
+
+"""),
+    cfg.StrOpt('cinder_store_application_credential_id',
+               default=None,
+               help="""
+Application credential ID for authenticating against cinder.
+
+When this option is set along with
+``cinder_store_application_credential_secret``,
+the Cinder backend will use application credential authentication instead of
+password authentication. This enables Zero Downtime Password Rotation (ZDPR)
+support for Glance deployments using Cinder as the image backend.
+
+If both application credential options are set, they take precedence over
+password authentication. If either option is not set, the driver falls back
+to password authentication using ``cinder_store_password``.
+
+Possible values:
+    * A valid application credential ID
+
+Related options:
+    * cinder_store_auth_address
+    * cinder_store_user_name
+    * cinder_store_application_credential_secret
+    * cinder_store_project_name
+    * cinder_store_project_domain_name
+    * cinder_store_user_domain_name
+
+"""),
+    cfg.StrOpt('cinder_store_application_credential_secret', secret=True,
+               help="""
+Application credential secret for authenticating against cinder.
+
+This must be used together with ``cinder_store_application_credential_id``.
+When both options are set, the Cinder backend will use application credential
+authentication instead of password authentication.
+
+Possible values:
+    * A valid application credential secret
+
+Related options:
+    * cinder_store_auth_address
+    * cinder_store_user_name
+    * cinder_store_application_credential_id
+    * cinder_store_project_name
+    * cinder_store_project_domain_name
+    * cinder_store_user_domain_name
 
 """),
     cfg.StrOpt('cinder_store_project_name',
@@ -432,14 +480,27 @@ def _reset_cinder_session():
 def get_cinder_session(conf):
     global CINDER_SESSION
     if not CINDER_SESSION:
-        auth = ksa_identity.V3Password(
-            password=conf.cinder_store_password,
-            username=conf.cinder_store_user_name,
-            user_domain_name=conf.cinder_store_user_domain_name,
-            project_name=conf.cinder_store_project_name,
-            project_domain_name=conf.cinder_store_project_domain_name,
-            auth_url=conf.cinder_store_auth_address
-        )
+        ac_id = getattr(conf,
+                        'cinder_store_application_credential_id', None)
+        ac_secret = getattr(conf,
+                            'cinder_store_application_credential_secret',
+                            None)
+
+        if ac_id and ac_secret:
+            auth = ksa_identity.V3ApplicationCredential(
+                application_credential_id=ac_id,
+                application_credential_secret=ac_secret,
+                auth_url=conf.cinder_store_auth_address
+            )
+        else:
+            auth = ksa_identity.V3Password(
+                password=conf.cinder_store_password,
+                username=conf.cinder_store_user_name,
+                user_domain_name=conf.cinder_store_user_domain_name,
+                project_name=conf.cinder_store_project_name,
+                project_domain_name=conf.cinder_store_project_domain_name,
+                auth_url=conf.cinder_store_auth_address
+            )
         if conf.cinder_api_insecure:
             verify = False
         elif conf.cinder_ca_certificates_file:
@@ -493,7 +554,8 @@ class Store(glance_store.driver.Store):
         self.mount = importlib.import_module('glance_store.common.fs_mount')
         self._set_url_prefix()
         if self.backend_group:
-            self.store_conf = getattr(self.conf, self.backend_group)
+            self.store_conf = glance_store.driver.BackendGroupConfiguration(
+                self.OPTIONS, self.backend_group, conf=self.conf)
         else:
             self.store_conf = self.conf.glance_store
         self.volume_api = cinder_utils.API()
@@ -555,10 +617,33 @@ class Store(glance_store.driver.Store):
         If above both conditions doesn't meet, it returns false.
         """
         try:
-            cinder_client = self.get_cinderclient(context=context,
-                                                  legacy_update=True)
+            # We will use either the service credentials defined in
+            # config file or the user context credentials
+            cinder_client = self.get_cinderclient(context=context)
             cinder_volume_type = self.store_conf.cinder_volume_type
-            volume = cinder_client.volumes.get(volume_id)
+            # Here we are assuming that the volume is stored in the
+            # service project or context user's project else this
+            # will return NotFound exception.
+            # Ideally we should be using service user's credentials
+            # defined in the config and the volume should be stored
+            # in the service (internal) project else we are opening the
+            # image-volume to modification by users which might lead
+            # to corruption of image.
+            try:
+                volume = self.volume_api.get(cinder_client, volume_id)
+            # NotFound Exception is translated to BackendException
+            except exceptions.BackendException as e:
+                # 'Volume <vol-id> could not be found.
+                # (HTTP 404) (Request-ID: <req-id>)'
+                if 'HTTP 404' in str(e):
+                    reason = (_LW("Image-Volume %s not found. If you have "
+                                  "upgraded your environment from single "
+                                  "store to multi store, transfer all your "
+                                  "Image-Volumes from user projects to "
+                                  "service project."
+                              % volume_id))
+                    LOG.warning(reason)
+                    return False
             if cinder_volume_type and volume.volume_type == cinder_volume_type:
                 return True
             elif not cinder_volume_type:
@@ -580,21 +665,22 @@ class Store(glance_store.driver.Store):
         return 'sudo glance-rootwrap %s' % rootwrap
 
     def is_user_overriden(self):
+        ac_id = getattr(self.store_conf,
+                        'cinder_store_application_credential_id', None)
+        ac_secret = getattr(self.store_conf,
+                            'cinder_store_application_credential_secret',
+                            None)
+        if ac_id and ac_secret:
+            return all([self.store_conf.get('cinder_store_' + key)
+                        for key in ['application_credential_id',
+                                    'application_credential_secret',
+                                    'auth_address']])
         return all([self.store_conf.get('cinder_store_' + key)
                     for key in ['user_name', 'password',
                                 'project_name', 'auth_address']])
 
-    def get_cinderclient(self, context=None, legacy_update=False,
-                         version='3.0'):
-        # NOTE: For legacy image update from single store to multiple
-        # stores we need to use admin context rather than user provided
-        # credentials
-        if legacy_update:
-            user_overriden = False
-            context = context.elevated()
-        else:
-            user_overriden = self.is_user_overriden()
-
+    def get_cinderclient(self, context=None, version='3.0'):
+        user_overriden = self.is_user_overriden()
         session = get_cinder_session(self.store_conf)
 
         if user_overriden:
@@ -676,10 +762,12 @@ class Store(glance_store.driver.Store):
             raise exceptions.BadStoreConfiguration(store_name="cinder",
                                                    reason=reason)
 
-    def _wait_volume_status(self, volume, status_transition, status_expected):
+    def _wait_volume_status(self, volume, status_transition, status_expected,
+                            client):
+        volume_id = volume.id
         max_recheck_wait = 15
         timeout = self.store_conf.cinder_state_transition_timeout
-        volume = volume.manager.get(volume.id)
+        volume = self.volume_api.get(client, volume_id)
         tries = 0
         elapsed = 0
         while volume.status == status_transition:
@@ -694,7 +782,7 @@ class Store(glance_store.driver.Store):
             time.sleep(wait)
             tries += 1
             elapsed += wait
-            volume = volume.manager.get(volume.id)
+            volume = self.volume_api.get(client, volume_id)
         if volume.status != status_expected:
             msg = (_('The status of volume %(volume_id)s is unexpected: '
                      'status = %(status)s, expected = %(expected)s.')
@@ -710,9 +798,73 @@ class Store(glance_store.driver.Store):
         except socket.gaierror:
             return socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
 
+    def _disconnect_and_detach(self, client, volume_id, multiattach, host,
+                               conn, device, attachment_id):
+        @utils.synchronized(volume_id, external=True)
+        def _disconnect_and_detach_with_lock(self, client, volume_id,
+                                             multiattach, host, conn,
+                                             device, attachment_id):
+            """This method disconnects and detaches a volume.
+
+            The decision to disconnect a volume is based on the number of
+            attachments it has on a particular host. If there are > 1
+            attachments for a specific volume on a given host, we should
+            not disconnect the volume.
+            """
+            should_disconnect = False
+            # If the volume is not multiattach, we should always disconnect
+            if not multiattach:
+                # Since the lock is acquired on volume_id, it's non-blocking
+                # for disconnecting different non-multiattach volumes
+                should_disconnect = True
+            else:
+                # Counting number of attachments on this host
+                conn_count = 0
+                volume = self.volume_api.get(client, volume_id)
+                attachments = volume.attachments
+                # When connections are <= 1, we should disconnect
+                if len(attachments) > 1:
+                    for attachment in attachments:
+                        if attachment['host_name'] == host:
+                            conn_count += 1
+                # If we have more than 1 attachment on the same host,
+                # we should not disconnect otherwise we can safely disconnect
+                if conn_count <= 1:
+                    should_disconnect = True
+
+            if should_disconnect:
+                if device:
+                    LOG.debug("Disconnecting volume %s from current host",
+                              volume_id)
+                    # disconnect_volume has it's own lock so it doesn't
+                    # require the additional lock here but to include the
+                    # attachment_delete call, we have to do disconnect here
+                    try:
+                        conn.disconnect_volume(device)
+                    except Exception:
+                        LOG.exception(_LE('Failed to disconnect volume '
+                                          '%(volume_id)s.'),
+                                      {'volume_id': volume_id})
+            if attachment_id:
+                # Delete the attachment.
+                # Cinder volume driver handles unmapping based on attachments
+                # so we don't need to handle anything here.
+                # We need to do this inside the lock since we fetch
+                # attachments to make disconnect decision which could be
+                # influenced by this call.
+                self.volume_api.attachment_delete(client, attachment_id)
+                LOG.debug('Attachment %(attachment_id)s deleted successfully.',
+                          {'attachment_id': attachment_id})
+
+        return _disconnect_and_detach_with_lock(self, client, volume_id,
+                                                multiattach, host, conn,
+                                                device, attachment_id)
+
     @contextlib.contextmanager
     def _open_cinder_volume(self, client, volume, mode):
         attach_mode = 'rw' if mode == 'wb' else 'ro'
+        attachment_id = None
+        conn = None
         device = None
         root_helper = self.get_root_helper()
         priv_context.init(root_helper=shlex.split(root_helper))
@@ -721,21 +873,17 @@ class Store(glance_store.driver.Store):
         use_multipath = self.store_conf.cinder_use_multipath
         enforce_multipath = self.store_conf.cinder_enforce_multipath
         volume_id = volume.id
+        multiattach = volume.multiattach
 
         connector_prop = connector.get_connector_properties(
             root_helper, my_ip, use_multipath, enforce_multipath, host=host)
 
-        if volume.multiattach:
-            attachment = attachment_state_manager.attach(client, volume_id,
-                                                         host,
-                                                         mode=attach_mode)
-        else:
-            attachment = self.volume_api.attachment_create(client, volume_id,
-                                                           mode=attach_mode)
+        attachment = self.volume_api.attachment_create(client, volume_id,
+                                                       mode=attach_mode)
         LOG.debug('Attachment %(attachment_id)s created successfully.',
                   {'attachment_id': attachment['id']})
 
-        volume = volume.manager.get(volume_id)
+        volume = self.volume_api.get(client, volume_id)
         attachment_id = attachment['id']
         connection_info = None
         try:
@@ -778,23 +926,10 @@ class Store(glance_store.driver.Store):
                               '%(volume_id)s.'), {'volume_id': volume.id})
             raise
         finally:
-            if device:
-                try:
-                    if volume.multiattach:
-                        attachment_state_manager.detach(
-                            client, attachment_id, volume_id, host, conn,
-                            connection_info, device)
-                    else:
-                        conn.disconnect_volume(device)
-                        if self.volume_connector_map.get(volume.id):
-                            del self.volume_connector_map[volume.id]
-                except Exception:
-                    LOG.exception(_LE('Failed to disconnect volume '
-                                      '%(volume_id)s.'),
-                                  {'volume_id': volume.id})
-
-            if not volume.multiattach:
-                self.volume_api.attachment_delete(client, attachment_id)
+            self._disconnect_and_detach(client, volume_id, multiattach,
+                                        host, conn, device, attachment_id)
+            if self.volume_connector_map.get(volume.id):
+                del self.volume_connector_map[volume.id]
 
     def _cinder_volume_data_iterator(self, client, volume, max_size, offset=0,
                                      chunk_size=None, partial_length=None):
@@ -842,7 +977,7 @@ class Store(glance_store.driver.Store):
         self._check_context(context)
         try:
             client = self.get_cinderclient(context, version='3.54')
-            volume = client.volumes.get(loc.volume_id)
+            volume = self.volume_api.get(client, loc.volume_id)
             size = int(volume.metadata.get('image_size',
                                            volume.size * units.Gi))
             iterator = self._cinder_volume_data_iterator(
@@ -885,7 +1020,7 @@ class Store(glance_store.driver.Store):
                               "internal error."))
             return 0
 
-    def _call_offline_extend(self, volume, size_gb):
+    def _call_offline_extend(self, volume, size_gb, client):
         size_gb += 1
         LOG.debug("Extending (offline) volume %(volume_id)s to %(size)s GB.",
                   {'volume_id': volume.id, 'size': size_gb})
@@ -893,7 +1028,8 @@ class Store(glance_store.driver.Store):
         try:
             volume = self._wait_volume_status(volume,
                                               'extending',
-                                              'available')
+                                              'available',
+                                              client)
             size_gb = volume.size
             return size_gb
         except exceptions.BackendException:
@@ -907,7 +1043,8 @@ class Store(glance_store.driver.Store):
         try:
             volume = self._wait_volume_status(volume,
                                               'extending',
-                                              'in-use')
+                                              'in-use',
+                                              client)
             size_gb = volume.size
             return size_gb
         except exceptions.BackendException:
@@ -939,6 +1076,14 @@ class Store(glance_store.driver.Store):
                 return
             f.write(write_props.buf)
             write_props.bytes_written += len(write_props.buf)
+            # Check if total written exceeds image_size
+            if (write_props.image_size and
+                    write_props.bytes_written > write_props.image_size):
+                raise exceptions.Invalid(
+                    _("Size exceeds: expected %(expected)d "
+                      "bytes, got %(actual)d bytes") %
+                    {'expected': write_props.image_size,
+                     'actual': write_props.bytes_written})
 
     def _offline_extend(self, client, volume, write_props):
         while write_props.need_extend:
@@ -946,7 +1091,7 @@ class Store(glance_store.driver.Store):
                 self._write_data(f, write_props)
             if write_props.need_extend:
                 write_props.size_gb = self._call_offline_extend(
-                    volume, write_props.size_gb)
+                    volume, write_props.size_gb, client)
 
     def _online_extend(self, client, volume, write_props):
         with self._open_cinder_volume(client, volume, 'wb') as f:
@@ -1029,7 +1174,8 @@ class Store(glance_store.driver.Store):
                                         metadata=metadata,
                                         volume_type=volume_type)
 
-        volume = self._wait_volume_status(volume, 'creating', 'available')
+        volume = self._wait_volume_status(volume, 'creating', 'available',
+                                          client)
         size_gb = volume.size
 
         failed = True
@@ -1066,6 +1212,23 @@ class Store(glance_store.driver.Store):
                     LOG.exception(_LE('Failed to delete of volume '
                                       '%(volume_id)s.'),
                                   {'volume_id': volume.id})
+
+        if image_size != 0 and write_props.bytes_written != image_size:
+            # Delete the partial volume
+            try:
+                volume.delete()
+                LOG.info(_LI("Partial volume %(volume_id)s deleted after "
+                             "exceeding image_size."),
+                         {'volume_id': volume.id})
+            except Exception:
+                LOG.exception(_LE('Failed to delete of volume '
+                                  '%(volume_id)s.'),
+                              {'volume_id': volume.id})
+            # Raise an exception with image size info
+            raise exceptions.Invalid(_(
+                "Size mismatch: expected %(expected)d  bytes, got %(actual)d "
+                "bytes") % {'expected': image_size,
+                            'actual': write_props.bytes_written})
 
         if write_props.image_size == 0:
             metadata.update({'image_size': str(write_props.bytes_written)})

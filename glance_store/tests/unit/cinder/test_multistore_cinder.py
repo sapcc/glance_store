@@ -22,7 +22,6 @@ import uuid
 
 import fixtures
 from oslo_config import cfg
-from oslo_utils import units
 
 import glance_store as store
 from glance_store import exceptions
@@ -46,6 +45,7 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
 
     def setUp(self):
         super(TestMultiCinderStore, self).setUp()
+        self.is_multistore = True
         enabled_backends = {
             "cinder1": "cinder",
             "cinder2": "cinder"
@@ -112,10 +112,12 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
         self._test_get_cinderclient_with_ca_certificates(group='cinder1')
 
     def test_get_cinderclient_legacy_update(self):
-        cc = self.store.get_cinderclient(self.fake_admin_context,
-                                         legacy_update=True)
-        self.assertEqual('admin_token', cc.client.auth.token)
-        self.assertEqual('http://foo/public_url', cc.client.auth.endpoint)
+        fake_endpoint = 'http://cinder.openstack.example.com/v2/fake_project'
+        self.config(cinder_endpoint_template=fake_endpoint, group='cinder1')
+        cc = self.store.get_cinderclient(self.context)
+        self.assertEqual(self.context.auth_token,
+                         cc.client.auth.token)
+        self.assertEqual(fake_endpoint, cc.client.auth.endpoint)
 
     def test_open_cinder_volume_multipath_enabled(self):
         self.config(cinder_use_multipath=True, group='cinder1')
@@ -221,32 +223,19 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
             type_match = self.store.is_image_associated_with_store(
                 self.context, fake_vol_id)
             self.assertFalse(type_match)
-
-    def test_cinder_get(self):
-        self._test_cinder_get(is_multi_store=True)
-
-    def test_cinder_get_size(self):
-        self._test_cinder_get_size(is_multi_store=True)
-
-    def test_cinder_get_size_with_metadata(self):
-        self._test_cinder_get_size_with_metadata(is_multi_store=True)
-
-    def test_cinder_add(self):
-        fake_volume = mock.MagicMock(id=str(uuid.uuid4()),
-                                     status='available',
-                                     size=1)
-        volume_file = io.BytesIO()
-        self._test_cinder_add(fake_volume, volume_file, is_multi_store=True)
-
-    def test_cinder_add_with_verifier(self):
-        fake_volume = mock.MagicMock(id=str(uuid.uuid4()),
-                                     status='available',
-                                     size=1)
-        volume_file = io.BytesIO()
-        verifier = mock.MagicMock()
-        self._test_cinder_add(fake_volume, volume_file, 1, verifier,
-                              is_multi_store=True)
-        verifier.update.assert_called_with(b"*" * units.Ki)
+            # When the Image-Volume is not found
+            mocked_cc.return_value.volumes.get = mock.MagicMock(
+                side_effect=cinder.cinder_exception.NotFound(code=404))
+            with mock.patch.object(cinder, 'LOG') as mock_log:
+                type_match = self.store.is_image_associated_with_store(
+                    self.context, fake_vol_id)
+                mock_log.warning.assert_called_with(
+                    "Image-Volume %s not found. If you have "
+                    "upgraded your environment from single store "
+                    "to multi store, transfer all your "
+                    "Image-Volumes from user projects to service "
+                    "project." % fake_vol_id)
+            self.assertFalse(type_match)
 
     def test_cinder_add_volume_full(self):
         e = IOError()
@@ -257,8 +246,7 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
                                      size=1)
         with mock.patch.object(volume_file, 'write', side_effect=e):
             self.assertRaises(exceptions.StorageFull,
-                              self._test_cinder_add, fake_volume, volume_file,
-                              is_multi_store=True)
+                              self._test_cinder_add, fake_volume, volume_file)
         fake_volume.delete.assert_called_once_with()
 
     def test_cinder_add_different_backend(self):
@@ -270,17 +258,7 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
                                      status='available',
                                      size=1)
         volume_file = io.BytesIO()
-        self._test_cinder_add(fake_volume, volume_file, backend="cinder2",
-                              is_multi_store=True)
-
-    def test_cinder_add_extend(self):
-        self._test_cinder_add_extend(is_multi_store=True)
-
-    def test_cinder_add_extend_online(self):
-        self._test_cinder_add_extend(is_multi_store=True, online=True)
-
-    def test_cinder_delete(self):
-        self._test_cinder_delete(is_multi_store=True)
+        self._test_cinder_add(fake_volume, volume_file, backend="cinder2")
 
     def test_set_url_prefix(self):
         self.assertEqual('cinder://cinder1', self.store._url_prefix)
@@ -303,3 +281,66 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
     def test_get_cinderclient_cinder_endpoint_template(self):
         self._test_get_cinderclient_cinder_endpoint_template(
             group='cinder1')
+
+    def test_get_cinderclient_with_application_credential(self):
+        self._test_get_cinderclient_with_application_credential(
+            group='cinder1')
+
+    def test_application_credential_from_backend_defaults(self):
+        cinder._reset_cinder_session()
+        self.config(
+            cinder_store_application_credential_id='default_ac_id',
+            group='backend_defaults')
+        self.config(
+            cinder_store_application_credential_secret='default_ac_secret',
+            group='backend_defaults')
+        self.config(
+            cinder_store_auth_address='default_auth_address',
+            group='backend_defaults')
+        with mock.patch.object(
+            cinder.ksa_session, 'Session') as fake_session, \
+            mock.patch.object(
+                cinder.ksa_identity,
+                'V3ApplicationCredential') as fake_ac_method:
+            fake_auth = mock.MagicMock()
+            fake_ac_method.return_value = fake_auth
+            cinder.get_cinder_session(self.store.store_conf)
+            fake_ac_method.assert_called_once_with(
+                application_credential_id='default_ac_id',
+                application_credential_secret='default_ac_secret',
+                auth_url='default_auth_address')
+            fake_session.assert_called_once_with(auth=fake_auth, verify=True)
+
+    def test_application_credential_backend_overrides_defaults(self):
+        cinder._reset_cinder_session()
+        self.config(
+            cinder_store_application_credential_id='default_ac_id',
+            group='backend_defaults')
+        self.config(
+            cinder_store_application_credential_secret='default_ac_secret',
+            group='backend_defaults')
+        self.config(
+            cinder_store_auth_address='default_auth_address',
+            group='backend_defaults')
+        self.config(
+            cinder_store_application_credential_id='cinder1_ac_id',
+            group='cinder1')
+        self.config(
+            cinder_store_application_credential_secret='cinder1_ac_secret',
+            group='cinder1')
+        self.config(
+            cinder_store_auth_address='cinder1_auth_address',
+            group='cinder1')
+        with mock.patch.object(
+            cinder.ksa_session, 'Session') as fake_session, \
+            mock.patch.object(
+                cinder.ksa_identity,
+                'V3ApplicationCredential') as fake_ac_method:
+            fake_auth = mock.MagicMock()
+            fake_ac_method.return_value = fake_auth
+            cinder.get_cinder_session(self.store.store_conf)
+            fake_ac_method.assert_called_once_with(
+                application_credential_id='cinder1_ac_id',
+                application_credential_secret='cinder1_ac_secret',
+                auth_url='cinder1_auth_address')
+            fake_session.assert_called_once_with(auth=fake_auth, verify=True)

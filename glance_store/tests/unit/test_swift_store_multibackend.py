@@ -27,8 +27,6 @@ import tempfile
 import uuid
 
 from oslo_config import cfg
-from oslo_utils import encodeutils
-from oslo_utils.secretutils import md5
 from oslo_utils import units
 import requests_mock
 import swiftclient
@@ -67,9 +65,18 @@ class SwiftTests(object):
 
     def mock_keystone_client(self):
         # mock keystone client functions to avoid dependency errors
-        swift.ks_v3 = mock.MagicMock()
-        swift.ks_session = mock.MagicMock()
-        swift.ks_client = mock.MagicMock()
+        ks_identity_patcher = mock.patch(
+            'glance_store._drivers.swift.store.ks_identity')
+        self.mock_identity = ks_identity_patcher.start()
+        self.addCleanup(ks_identity_patcher.stop)
+        ks_session_patcher = mock.patch(
+            'glance_store._drivers.swift.store.ks_session')
+        self.mock_session = ks_session_patcher.start()
+        self.addCleanup(ks_session_patcher.stop)
+        ks_client_patcher = mock.patch(
+            'glance_store._drivers.swift.store.ks_client')
+        self.mock_client = ks_client_patcher.start()
+        self.addCleanup(ks_client_patcher.stop)
 
     def stub_out_swiftclient(self, swift_store_auth_version):
         fixture_containers = ['glance']
@@ -111,7 +118,7 @@ class SwiftTests(object):
                 if kwargs.get('headers'):
                     manifest = kwargs.get('headers').get('X-Object-Manifest')
                     etag = kwargs.get('headers') \
-                                 .get('ETag', md5(
+                                 .get('ETag', hashlib.md5(
                                      b'', usedforsecurity=False).hexdigest())
                     fixture_headers[fixture_key] = {
                         'manifest': True,
@@ -124,7 +131,7 @@ class SwiftTests(object):
                     fixture_object = io.BytesIO()
                     read_len = 0
                     chunk = contents.read(CHUNKSIZE)
-                    checksum = md5(usedforsecurity=False)
+                    checksum = hashlib.md5(usedforsecurity=False)
                     while chunk:
                         fixture_object.write(chunk)
                         read_len += len(chunk)
@@ -134,8 +141,8 @@ class SwiftTests(object):
                 else:
                     fixture_object = io.BytesIO(contents)
                     read_len = len(contents)
-                    etag = md5(fixture_object.getvalue(),
-                               usedforsecurity=False).hexdigest()
+                    etag = hashlib.md5(fixture_object.getvalue(),
+                                       usedforsecurity=False).hexdigest()
                 if read_len > MAX_SWIFT_OBJECT_SIZE:
                     msg = ('Image size:%d exceeds Swift max:%d' %
                            (read_len, MAX_SWIFT_OBJECT_SIZE))
@@ -397,8 +404,8 @@ class SwiftTests(object):
         self.store.configure()
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents,
+                                        usedforsecurity=False).hexdigest()
         expected_image_id = str(uuid.uuid4())
         loc = "swift+https://tenant%%3Auser1:key@localhost:8080/glance/%s"
         expected_location = loc % (expected_image_id)
@@ -425,6 +432,62 @@ class SwiftTests(object):
 
         self.assertEqual(expected_swift_contents, new_image_contents)
         self.assertEqual(expected_swift_size, new_image_swift_size)
+
+    def test_add_image_exceeding_max_size_raises_exception(self):
+        """Test that we can add an image via the swift backend."""
+        importlib.reload(swift)
+        self.mock_keystone_client()
+        self.config()
+        self.store = Store(self.conf, backend="swift1")
+        self.store.configure()
+        expected_swift_size = FIVE_KB
+        # 1KB more data than actual expected size
+        expected_swift_contents = b"*" * (expected_swift_size + units.Ki)
+        expected_image_id = str(uuid.uuid4())
+        custom_size = units.Ki
+        self.store.large_object_size = custom_size
+        self.store.large_object_chunk_size = custom_size
+
+        image_swift = io.BytesIO(expected_swift_contents)
+
+        with mock.patch.object(self.store,
+                               '_delete_stale_chunks') as mock_delete:
+            self.assertRaisesRegex(
+                exceptions.Invalid, "Size exceeds: expected",
+                self.store.add, expected_image_id, image_swift,
+                expected_swift_size)
+
+        # The position should be equal to total input size
+        self.assertEqual(image_swift.tell(), len(expected_swift_contents))
+        mock_delete.assert_called_once()
+
+    def test_write_less_than_declared_raises_exception(self):
+        """Test that we can add an image via the swift backend."""
+        importlib.reload(swift)
+        self.mock_keystone_client()
+        self.config()
+        self.store = Store(self.conf, backend="swift1")
+        self.store.configure()
+        expected_swift_size = FIVE_KB
+        # 1KB fewer data than actual expected size
+        expected_swift_contents = b"*" * (expected_swift_size - units.Ki)
+        expected_image_id = str(uuid.uuid4())
+        custom_size = units.Ki
+        self.store.large_object_size = custom_size
+        self.store.large_object_chunk_size = custom_size
+
+        image_swift = io.BytesIO(expected_swift_contents)
+
+        with mock.patch.object(self.store,
+                               '_delete_stale_chunks') as mock_delete:
+            self.assertRaisesRegex(
+                exceptions.Invalid, "Size mismatch: expected",
+                self.store.add, expected_image_id, image_swift,
+                expected_swift_size)
+
+        # The position should be equal to actual data size
+        self.assertEqual(image_swift.tell(), len(expected_swift_contents))
+        mock_delete.assert_called_once()
 
     def test_add_multi_store(self):
 
@@ -522,7 +585,8 @@ class SwiftTests(object):
             expected_swift_size = FIVE_KB
             expected_swift_contents = b"*" * expected_swift_size
             expected_checksum = \
-                md5(expected_swift_contents, usedforsecurity=False).hexdigest()
+                hashlib.md5(expected_swift_contents,
+                            usedforsecurity=False).hexdigest()
 
             image_swift = io.BytesIO(expected_swift_contents)
 
@@ -574,17 +638,10 @@ class SwiftTests(object):
         global SWIFT_PUT_OBJECT_CALLS
         SWIFT_PUT_OBJECT_CALLS = 0
 
-        # We check the exception text to ensure the container
-        # missing text is found in it, otherwise, we would have
-        # simply used self.assertRaises here
-        exception_caught = False
-        try:
-            self.store.add(str(uuid.uuid4()), image_swift, 0)
-        except exceptions.BackendException as e:
-            exception_caught = True
-            self.assertIn("container noexist does not exist in Swift",
-                          encodeutils.exception_to_unicode(e))
-        self.assertTrue(exception_caught)
+        msg = "container noexist does not exist in Swift"
+        self.assertRaisesRegex(exceptions.BackendException, msg,
+                               self.store.add, str(uuid.uuid4()),
+                               image_swift, 0)
         self.assertEqual(0, SWIFT_PUT_OBJECT_CALLS)
 
     @mock.patch('glance_store._drivers.swift.utils'
@@ -597,8 +654,8 @@ class SwiftTests(object):
         """
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents,
+                                        usedforsecurity=False).hexdigest()
         expected_image_id = str(uuid.uuid4())
         loc = 'swift+config://ref1/noexist/%s'
         expected_location = loc % (expected_image_id)
@@ -644,8 +701,8 @@ class SwiftTests(object):
         """
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents,
+                                        usedforsecurity=False).hexdigest()
         expected_image_id = str(uuid.uuid4())
         container = 'randomname_' + expected_image_id[:2]
         loc = 'swift+config://ref1/%s/%s'
@@ -712,18 +769,11 @@ class SwiftTests(object):
         global SWIFT_PUT_OBJECT_CALLS
         SWIFT_PUT_OBJECT_CALLS = 0
 
-        # We check the exception text to ensure the container
-        # missing text is found in it, otherwise, we would have
-        # simply used self.assertRaises here
-        exception_caught = False
-        try:
-            self.store.add(expected_image_id, image_swift, 0)
-        except exceptions.BackendException as e:
-            exception_caught = True
-            expected_msg = "container %s does not exist in Swift"
-            expected_msg = expected_msg % expected_container
-            self.assertIn(expected_msg, encodeutils.exception_to_unicode(e))
-        self.assertTrue(exception_caught)
+        expected_msg = "container %s does not exist in Swift"
+        expected_msg = expected_msg % expected_container
+        self.assertRaisesRegex(exceptions.BackendException, expected_msg,
+                               self.store.add, expected_image_id,
+                               image_swift, 0)
         self.assertEqual(0, SWIFT_PUT_OBJECT_CALLS)
 
     @mock.patch('glance_store._drivers.swift.utils'
@@ -869,8 +919,8 @@ class SwiftTests(object):
         """
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents,
+                                        usedforsecurity=False).hexdigest()
         expected_image_id = str(uuid.uuid4())
         loc = 'swift+config://ref1/glance/%s'
         expected_location = loc % (expected_image_id)
@@ -924,8 +974,8 @@ class SwiftTests(object):
         # Set up a 'large' image of 5KB
         expected_swift_size = FIVE_KB
         expected_swift_contents = b"*" * expected_swift_size
-        expected_checksum = md5(expected_swift_contents,
-                                usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(expected_swift_contents,
+                                        usedforsecurity=False).hexdigest()
         expected_image_id = str(uuid.uuid4())
         loc = 'swift+config://ref1/glance/%s'
         expected_location = loc % (expected_image_id)
@@ -1279,11 +1329,68 @@ class SwiftTests(object):
                               swift_store_auth_insecure=True,
                               swift_store_config_file=None)
 
-    @mock.patch("glance_store._drivers.swift.store.ks_identity")
-    @mock.patch("glance_store._drivers.swift.store.ks_session")
-    @mock.patch("glance_store._drivers.swift.store.ks_client")
-    def _init_client(self, mock_client, mock_session, mock_identity, verify,
-                     **kwargs):
+    def test_init_client_multi_tenant_with_password(self):
+        """Test keystone client initialized with password in multi-tenant"""
+        # In multi-tenant mode with password authentication
+        with mock.patch.object(swift.MultiTenantStore, '_set_url_prefix'):
+            self.config(
+                group="swift1",
+                swift_store_multi_tenant=True,
+                swift_store_config_file=None,
+                swift_store_user='service:glance-swift',
+                swift_store_key='admin',
+                swift_store_container='glance',
+                swift_store_auth_address='https://example.com',
+                swift_store_auth_version='3')
+            store = Store(self.conf, backend="swift1")
+            store.configure()
+            # prepare client and session
+            trustee_session = mock.MagicMock()
+            trustor_session = mock.MagicMock()
+            main_session = mock.MagicMock()
+            trustee_client = mock.MagicMock()
+            trustee_client.session.get_user_id.return_value = 'fake_user'
+            trustor_client = mock.MagicMock()
+            auth_ref = {'roles': [{'name': 'fake_role'}]}
+            trustor_client.session.auth.get_auth_ref.return_value = auth_ref
+            trustor_client.trusts.create.return_value = mock.MagicMock(
+                id='fake_trust')
+            main_client = mock.MagicMock()
+            self.mock_session.Session.side_effect = [
+                trustor_session, trustee_session, main_session]
+            self.mock_client.Client.side_effect = [
+                trustor_client, trustee_client, main_client]
+
+            # initialize client
+            ctxt = mock.MagicMock()
+            ctxt.auth_token = 'fake_token'
+            ctxt.project_id = 'fake_project'
+            ctxt.user_id = 'fake_user_id'
+            client = store.init_client(location=mock.MagicMock(), context=ctxt)
+
+            # test trustee usage with password
+            # Verify V3Password was called for trustee (without trust_id)
+            calls = self.mock_identity.V3Password.call_args_list
+            self.assertGreater(
+                len(calls), 0,
+                "V3Password should be called")
+            # Find the call without trust_id (trustee auth)
+            trustee_call = None
+            for call in calls:
+                args, kwargs = call
+                if 'trust_id' not in kwargs:
+                    trustee_call = call
+                    break
+            self.assertIsNotNone(
+                trustee_call,
+                "V3Password should be called for trustee")
+            args, kwargs = trustee_call
+            self.assertEqual(kwargs['username'], 'glance-swift')
+            self.assertEqual(kwargs['password'], 'admin')
+            self.assertEqual(kwargs['project_name'], 'service')
+            self.assertEqual(main_client, client)
+
+    def _init_client(self, verify, **kwargs):
         # initialize store and connection parameters
         self.config(group="swift1", **kwargs)
         store = Store(self.conf, backend="swift1")
@@ -1304,25 +1411,26 @@ class SwiftTests(object):
         trustor_client.trusts.create.return_value = mock.MagicMock(
             id='fake_trust')
         main_client = mock.MagicMock()
-        mock_session.Session.side_effect = [trustor_session, trustee_session,
-                                            main_session]
-        mock_client.Client.side_effect = [trustor_client, trustee_client,
-                                          main_client]
+        self.mock_session.Session.side_effect = [
+            trustor_session, trustee_session, main_session]
+        self.mock_client.Client.side_effect = [
+            trustor_client, trustee_client, main_client]
         # initialize client
         ctxt = mock.MagicMock()
         client = store.init_client(location=mock.MagicMock(), context=ctxt)
         # test trustor usage
-        mock_identity.V3Token.assert_called_once_with(
+        self.mock_identity.V3Token.assert_called_once_with(
             auth_url=default_swift_reference.get('auth_address'),
             token=ctxt.auth_token,
             project_id=ctxt.project_id
         )
-        mock_session.Session.assert_any_call(auth=mock_identity.V3Token(),
-                                             verify=verify)
-        mock_client.Client.assert_any_call(session=trustor_session)
+        self.mock_session.Session.assert_any_call(
+            auth=self.mock_identity.V3Token(),
+            verify=verify)
+        self.mock_client.Client.assert_any_call(session=trustor_session)
         # test trustee usage and trust creation
         tenant_name, user = default_swift_reference.get('user').split(':')
-        mock_identity.V3Password.assert_any_call(
+        self.mock_identity.V3Password.assert_any_call(
             auth_url=default_swift_reference.get('auth_address'),
             username=user,
             password=default_swift_reference.get('key'),
@@ -1333,15 +1441,16 @@ class SwiftTests(object):
             project_domain_name=default_swift_reference.get(
                 'project_domain_name')
         )
-        mock_session.Session.assert_any_call(auth=mock_identity.V3Password(),
-                                             verify=verify)
-        mock_client.Client.assert_any_call(session=trustee_session)
+        self.mock_session.Session.assert_any_call(
+            auth=self.mock_identity.V3Password(),
+            verify=verify)
+        self.mock_client.Client.assert_any_call(session=trustee_session)
         trustor_client.trusts.create.assert_called_once_with(
             trustee_user='fake_user', trustor_user=ctxt.user_id,
             project=ctxt.project_id, impersonation=True,
             role_names=['fake_role']
         )
-        mock_identity.V3Password.assert_any_call(
+        self.mock_identity.V3Password.assert_any_call(
             auth_url=default_swift_reference.get('auth_address'),
             username=user,
             password=default_swift_reference.get('key'),
@@ -1352,11 +1461,11 @@ class SwiftTests(object):
             project_domain_name=default_swift_reference.get(
                 'project_domain_name')
         )
-        mock_client.Client.assert_any_call(session=main_session)
+        self.mock_client.Client.assert_any_call(session=main_session)
         self.assertEqual(main_client, client)
 
 
-class TestStoreAuthV1(base.MultiStoreBaseTest, SwiftTests,
+class TestStoreAuthV3(base.MultiStoreBaseTest, SwiftTests,
                       test_store_capabilities.TestStoreCapabilitiesChecking):
 
     # NOTE(flaper87): temporary until we
@@ -1366,13 +1475,13 @@ class TestStoreAuthV1(base.MultiStoreBaseTest, SwiftTests,
 
     def getConfig(self):
         conf = SWIFT_CONF.copy()
-        conf['swift_store_auth_version'] = '1'
+        conf['swift_store_auth_version'] = '3'
         conf['swift_store_user'] = 'tenant:user1'
         return conf
 
     def setUp(self):
         """Establish a clean test environment."""
-        super(TestStoreAuthV1, self).setUp()
+        super(TestStoreAuthV3, self).setUp()
         enabled_backends = {
             "swift1": "swift",
             "swift2": "swift",
@@ -1407,48 +1516,7 @@ class TestStoreAuthV1(base.MultiStoreBaseTest, SwiftTests,
         self.register_store_backend_schemes(self.store, 'swift', 'swift1')
         self.addCleanup(self.conf.reset)
 
-
-class TestStoreAuthV2(TestStoreAuthV1):
-
-    def getConfig(self):
-        config = super(TestStoreAuthV2, self).getConfig()
-        config['swift_store_auth_version'] = '2'
-        config['swift_store_user'] = 'tenant:user1'
-        return config
-
-    def test_v2_with_no_tenant(self):
-        uri = "swift://failme:key@auth_address/glance/%s" % (FAKE_UUID)
-        loc = location.get_location_from_uri_and_backend(
-            uri, "swift1", conf=self.conf)
-        self.assertRaises(exceptions.BadStoreUri,
-                          self.store.get,
-                          loc)
-
-    def test_v2_multi_tenant_location(self):
-        config = self.getConfig()
-        config['swift_store_multi_tenant'] = True
-        self.config(group="swift1", **config)
-        uri = "swift://auth_address/glance/%s" % (FAKE_UUID)
-        loc = location.get_location_from_uri_and_backend(
-            uri, "swift1", conf=self.conf)
-        self.assertEqual('swift', loc.store_name)
-
-
-class TestStoreAuthV3(TestStoreAuthV1):
-
-    def getConfig(self):
-        config = super(TestStoreAuthV3, self).getConfig()
-        config['swift_store_auth_version'] = '3'
-        config['swift_store_user'] = 'tenant:user1'
-        return config
-
-    @mock.patch("glance_store._drivers.swift.store.ks_identity")
-    @mock.patch("glance_store._drivers.swift.store.ks_session")
-    @mock.patch("glance_store._drivers.swift.store.ks_client")
-    def test_init_client_single_tenant(self,
-                                       mock_client,
-                                       mock_session,
-                                       mock_identity):
+    def test_init_client_single_tenant(self):
         """Test that keystone client was initialized correctly"""
         # initialize client
         store = Store(self.conf, backend="swift1")
@@ -1459,24 +1527,18 @@ class TestStoreAuthV3(TestStoreAuthV1):
             uri, "swift1", conf=self.conf)
         ctxt = mock.MagicMock()
         store.init_client(location=loc.store_location, context=ctxt)
-        mock_identity.V3Password.assert_called_once_with(
+        self.mock_identity.V3Password.assert_called_once_with(
             auth_url=loc.store_location.swift_url + '/',
             username="user1", password="key",
             project_name="tenant",
             project_domain_id='default', project_domain_name=None,
             user_domain_id='default', user_domain_name=None,)
-        mock_session.Session.assert_called_once_with(
-            auth=mock_identity.V3Password(), verify=True)
-        mock_client.Client.assert_called_once_with(
-            session=mock_session.Session())
+        self.mock_session.Session.assert_called_once_with(
+            auth=self.mock_identity.V3Password(), verify=True)
+        self.mock_client.Client.assert_called_once_with(
+            session=self.mock_session.Session())
 
-    @mock.patch("glance_store._drivers.swift.store.ks_identity")
-    @mock.patch("glance_store._drivers.swift.store.ks_session")
-    @mock.patch("glance_store._drivers.swift.store.ks_client")
-    def test_init_client_single_tenant_with_domain_ids(self,
-                                                       mock_client,
-                                                       mock_session,
-                                                       mock_identity):
+    def test_init_client_single_tenant_with_domain_ids(self):
         """Test that keystone client was initialized correctly"""
         conf = self.getConfig()
         conf['default_swift_reference'] = 'ref4'
@@ -1489,24 +1551,18 @@ class TestStoreAuthV3(TestStoreAuthV1):
             uri, "swift1", conf=self.conf)
         ctxt = mock.MagicMock()
         store.init_client(location=loc.store_location, context=ctxt)
-        mock_identity.V3Password.assert_called_once_with(
+        self.mock_identity.V3Password.assert_called_once_with(
             auth_url=loc.store_location.swift_url + '/',
             username="user1", password="key",
             project_name="tenant",
             project_domain_id='projdomainid', project_domain_name=None,
             user_domain_id='userdomainid', user_domain_name=None)
-        mock_session.Session.assert_called_once_with(
-            auth=mock_identity.V3Password(), verify=True)
-        mock_client.Client.assert_called_once_with(
-            session=mock_session.Session())
+        self.mock_session.Session.assert_called_once_with(
+            auth=self.mock_identity.V3Password(), verify=True)
+        self.mock_client.Client.assert_called_once_with(
+            session=self.mock_session.Session())
 
-    @mock.patch("glance_store._drivers.swift.store.ks_identity")
-    @mock.patch("glance_store._drivers.swift.store.ks_session")
-    @mock.patch("glance_store._drivers.swift.store.ks_client")
-    def test_init_client_single_tenant_with_domain_names(self,
-                                                         mock_client,
-                                                         mock_session,
-                                                         mock_identity):
+    def test_init_client_single_tenant_with_domain_names(self):
         """Test that keystone client was initialized correctly"""
         conf = self.getConfig()
         conf['default_swift_reference'] = 'ref5'
@@ -1519,16 +1575,119 @@ class TestStoreAuthV3(TestStoreAuthV1):
             uri, "swift1", conf=self.conf)
         ctxt = mock.MagicMock()
         store.init_client(location=loc.store_location, context=ctxt)
-        mock_identity.V3Password.assert_called_once_with(
+        self.mock_identity.V3Password.assert_called_once_with(
             auth_url=loc.store_location.swift_url + '/',
             username="user1", password="key",
             project_name="tenant",
             project_domain_id=None, project_domain_name='projdomain',
             user_domain_id=None, user_domain_name='userdomain')
+        self.mock_session.Session.assert_called_once_with(
+            auth=self.mock_identity.V3Password(), verify=True)
+        self.mock_client.Client.assert_called_once_with(
+            session=self.mock_session.Session())
+
+    @mock.patch("glance_store._drivers.swift.store.ks_identity")
+    @mock.patch("glance_store._drivers.swift.store.ks_session")
+    @mock.patch("glance_store._drivers.swift.store.ks_client")
+    def test_init_client_single_tenant_with_application_credentials(
+            self, mock_client, mock_session, mock_identity):
+        """Test keystone client initialized correctly with app creds"""
+        # initialize client
+        conf = self.getConfig()
+        conf['default_swift_reference'] = 'ref6'
+        self.config(group="swift1", **conf)
+        store = Store(self.conf, backend="swift1")
+        store.configure()
+        uri = "swift+config://ref6/glance/%s" % FAKE_UUID
+        loc = location.get_location_from_uri_and_backend(
+            uri, "swift1", conf=self.conf)
+        ctxt = mock.MagicMock()
+        store.init_client(location=loc.store_location, context=ctxt)
+        mock_identity.V3ApplicationCredential.assert_called_once_with(
+            auth_url=loc.store_location.swift_url + '/',
+            application_credential_id='app-cred-id-123',
+            application_credential_secret='app-cred-secret-456',
+            project_domain_id='default', project_domain_name=None,
+            user_domain_id='default', user_domain_name=None,)
         mock_session.Session.assert_called_once_with(
-            auth=mock_identity.V3Password(), verify=True)
+            auth=mock_identity.V3ApplicationCredential(), verify=True)
         mock_client.Client.assert_called_once_with(
             session=mock_session.Session())
+
+    @mock.patch("glance_store._drivers.swift.store.ks_identity")
+    @mock.patch("glance_store._drivers.swift.store.ks_session")
+    @mock.patch("glance_store._drivers.swift.store.ks_client")
+    def test_init_client_single_tenant_app_creds_with_domains(
+            self, mock_client, mock_session, mock_identity):
+        """Test keystone client init with app creds and domain IDs"""
+        # initialize client
+        conf = self.getConfig()
+        conf['default_swift_reference'] = 'ref7'
+        self.config(group="swift1", **conf)
+        store = Store(self.conf, backend="swift1")
+        store.configure()
+        uri = "swift+config://ref7/glance/%s" % FAKE_UUID
+        loc = location.get_location_from_uri_and_backend(
+            uri, "swift1", conf=self.conf)
+        ctxt = mock.MagicMock()
+        store.init_client(location=loc.store_location, context=ctxt)
+        mock_identity.V3ApplicationCredential.assert_called_once_with(
+            auth_url=loc.store_location.swift_url + '/',
+            application_credential_id='app-cred-id-789',
+            application_credential_secret='app-cred-secret-012',
+            project_domain_id='projdomainid', project_domain_name=None,
+            user_domain_id='userdomainid', user_domain_name=None,)
+        mock_session.Session.assert_called_once_with(
+            auth=mock_identity.V3ApplicationCredential(), verify=True)
+        mock_client.Client.assert_called_once_with(
+            session=mock_session.Session())
+
+    def test_get_connection_with_application_credentials(self):
+        """Test get_connection with application credentials"""
+        conf = self.getConfig()
+        conf['default_swift_reference'] = 'ref6'
+        self.config(group="swift1", **conf)
+        store = Store(self.conf, backend="swift1")
+        store.configure()
+        uri = "swift+config://ref6/glance/%s" % FAKE_UUID
+        loc = location.get_location_from_uri_and_backend(
+            uri, "swift1", conf=self.conf)
+        conn = store.get_connection(location=loc.store_location)
+        # Verify connection was created with application credentials
+        self.assertIsNotNone(conn)
+        self.assertEqual(conn.os_options.get('application_credential_id'),
+                         'app-cred-id-123')
+        self.assertEqual(conn.os_options.get('application_credential_secret'),
+                         'app-cred-secret-456')
+        # Should not have user/key when using application credentials
+        self.assertIsNone(conn.user)
+        self.assertIsNone(conn.key)
+
+    def test_partial_application_credential_id_only(self):
+        """Test that BadStoreUri is raised when only app_cred_id is provided"""
+        conf = self.getConfig()
+        conf['default_swift_reference'] = 'ref8'
+        self.config(group="swift1", **conf)
+        store = Store(self.conf, backend="swift1")
+        store.configure()
+        uri = "swift+config://ref8/glance/%s" % FAKE_UUID
+        self.assertRaises(exceptions.BadStoreUri,
+                          location.get_location_from_uri_and_backend,
+                          uri, "swift1", conf=self.conf)
+
+    def test_partial_application_credential_secret_only(self):
+        """Test that BadStoreUri is raised when only app_cred_secret is
+        provided
+        """
+        conf = self.getConfig()
+        conf['default_swift_reference'] = 'ref9'
+        self.config(group="swift1", **conf)
+        store = Store(self.conf, backend="swift1")
+        store.configure()
+        uri = "swift+config://ref9/glance/%s" % FAKE_UUID
+        self.assertRaises(exceptions.BadStoreUri,
+                          location.get_location_from_uri_and_backend,
+                          uri, "swift1", conf=self.conf)
 
 
 class FakeConnection(object):
@@ -1584,7 +1743,7 @@ class TestSingleTenantStoreConnections(base.MultiStoreBaseTest):
         self.store = swift.SingleTenantStore(self.conf, backend="swift1")
         self.store.configure()
         specs = {'scheme': 'swift',
-                 'auth_or_store_url': 'example.com/v2/',
+                 'auth_or_store_url': 'example.com/v3/',
                  'user': 'tenant:user1',
                  'key': 'key1',
                  'container': 'cont',
@@ -1595,71 +1754,38 @@ class TestSingleTenantStoreConnections(base.MultiStoreBaseTest):
         self.register_store_backend_schemes(self.store, 'swift', 'swift1')
         self.addCleanup(self.conf.reset)
 
-    def test_basic_connection(self):
-        connection = self.store.get_connection(self.location)
-        self.assertEqual('https://example.com/v2/', connection.authurl)
-        self.assertEqual('2', connection.auth_version)
-        self.assertEqual('user1', connection.user)
-        self.assertEqual('tenant', connection.tenant_name)
-        self.assertEqual('key1', connection.key)
-        self.assertIsNone(connection.preauthurl)
-        self.assertFalse(connection.insecure)
-        self.assertEqual({'service_type': 'object-store',
-                          'endpoint_type': 'publicURL'},
-                         connection.os_options)
-
-    def test_connection_with_conf_endpoint(self):
-        ctx = mock.MagicMock(user='tenant:user1', tenant='tenant')
-        self.config(group="swift1",
-                    swift_store_endpoint='https://internal.com')
+    @mock.patch("keystoneauth1.session.Session.get_endpoint")
+    @mock.patch("keystoneauth1.session.Session.get_auth_headers",
+                new=mock.Mock())
+    def _test_connection_manager_authv3_conf_endpoint(
+            self, mock_ep, expected_endpoint="https://from-catalog.com"):
+        mock_ep.return_value = "https://from-catalog.com"
         self.store.configure()
-        connection = self.store.get_connection(self.location, context=ctx)
-        self.assertEqual('https://example.com/v2/', connection.authurl)
-        self.assertEqual('2', connection.auth_version)
-        self.assertEqual('user1', connection.user)
-        self.assertEqual('tenant', connection.tenant_name)
-        self.assertEqual('key1', connection.key)
-        self.assertEqual('https://internal.com', connection.preauthurl)
-        self.assertFalse(connection.insecure)
-        self.assertEqual({'service_type': 'object-store',
-                          'endpoint_type': 'publicURL'},
-                         connection.os_options)
+        connection_manager = manager.SingleTenantConnectionManager(
+            store=self.store,
+            store_location=self.location,
+        )
+        conn = connection_manager._init_connection()
+        self.assertEqual(expected_endpoint, conn.preauthurl)
 
-    def test_connection_with_conf_endpoint_no_context(self):
-        self.config(group="swift1",
-                    swift_store_endpoint='https://internal.com')
-        self.store.configure()
-        connection = self.store.get_connection(self.location)
-        self.assertEqual('https://example.com/v2/', connection.authurl)
-        self.assertEqual('2', connection.auth_version)
-        self.assertEqual('user1', connection.user)
-        self.assertEqual('tenant', connection.tenant_name)
-        self.assertEqual('key1', connection.key)
-        self.assertEqual('https://internal.com', connection.preauthurl)
-        self.assertFalse(connection.insecure)
-        self.assertEqual({'service_type': 'object-store',
-                          'endpoint_type': 'publicURL'},
-                         connection.os_options)
+    def test_connection_manager_without_conf_endpoint(self):
+        self._test_connection_manager_authv3_conf_endpoint()
+
+    def test_connection_manager_with_conf_endpoint(self):
+        self.config(group="swift1", swift_store_endpoint='http://localhost')
+        self._test_connection_manager_authv3_conf_endpoint(
+            expected_endpoint='http://localhost')
 
     def test_connection_with_no_trailing_slash(self):
-        self.location.auth_or_store_url = 'example.com/v2'
+        self.location.auth_or_store_url = 'example.com/v3'
         connection = self.store.get_connection(self.location)
-        self.assertEqual('https://example.com/v2/', connection.authurl)
+        self.assertEqual('https://example.com/v3/', connection.authurl)
 
     def test_connection_insecure(self):
         self.config(group="swift1", swift_store_auth_insecure=True)
         self.store.configure()
         connection = self.store.get_connection(self.location)
         self.assertTrue(connection.insecure)
-
-    def test_connection_with_auth_v1(self):
-        self.config(group="swift1", swift_store_auth_version='1')
-        self.store.configure()
-        self.location.user = 'auth_v1_user'
-        connection = self.store.get_connection(self.location)
-        self.assertEqual('1', connection.auth_version)
-        self.assertEqual('auth_v1_user', connection.user)
-        self.assertIsNone(connection.tenant_name)
 
     def test_connection_invalid_user(self):
         self.store.configure()
@@ -1720,7 +1846,7 @@ class TestSingleTenantStoreConnections(base.MultiStoreBaseTest):
                           self.location.uri)
 
     def test_ref_overrides_defaults(self):
-        self.config(group="swift1", swift_store_auth_version='2',
+        self.config(group="swift1",
                     swift_store_user='testuser',
                     swift_store_key='testpass',
                     swift_store_auth_address='testaddress',
@@ -2095,6 +2221,32 @@ class TestCreatingLocations(base.MultiStoreBaseTest):
         self.assertEqual('https://some_internal_endpoint',
                          store._get_endpoint(self.ctxt))
 
+    def test_multi_tenant_create_location_with_missing_container(self):
+        """Test create_location() raises BadStoreConfiguration when None"""
+        # Configure multi-tenant without container
+        self.config(
+            group="swift1",
+            swift_store_multi_tenant=True,
+            swift_store_container=None)  # Missing container!
+        store = swift.MultiTenantStore(self.conf, backend="swift1")
+        store.configure()
+        # create_location should raise BadStoreConfiguration, not TypeError
+        self.assertRaises(exceptions.BadStoreConfiguration,
+                          store.create_location, 'image-id', context=self.ctxt)
+
+    def test_multi_tenant_create_location_with_empty_container(self):
+        """Test create_location() raises BadStoreConfiguration when empty"""
+        # Configure multi-tenant with empty container
+        self.config(
+            group="swift1",
+            swift_store_multi_tenant=True,
+            swift_store_container='')  # Empty container!
+        store = swift.MultiTenantStore(self.conf, backend="swift1")
+        store.configure()
+        # create_location should raise BadStoreConfiguration
+        self.assertRaises(exceptions.BadStoreConfiguration,
+                          store.create_location, 'image-id', context=self.ctxt)
+
 
 class TestChunkReader(base.MultiStoreBaseTest):
 
@@ -2139,14 +2291,15 @@ class TestChunkReader(base.MultiStoreBaseTest):
         """
         CHUNKSIZE = 100
         data = b'*' * units.Ki
-        expected_checksum = md5(data, usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(data,
+                                        usedforsecurity=False).hexdigest()
         expected_multihash = hashlib.sha256(data).hexdigest()
         data_file = tempfile.NamedTemporaryFile()
         data_file.write(data)
         data_file.flush()
         infile = open(data_file.name, 'rb')
         bytes_read = 0
-        checksum = md5(usedforsecurity=False)
+        checksum = hashlib.md5(usedforsecurity=False)
         os_hash_value = hashlib.sha256()
         while True:
             cr = swift.ChunkReader(infile, checksum, os_hash_value, CHUNKSIZE)
@@ -2168,10 +2321,10 @@ class TestChunkReader(base.MultiStoreBaseTest):
         Replicate what goes on in the Swift driver with the
         repeated creation of the ChunkReader object
         """
-        expected_checksum = md5(b'', usedforsecurity=False).hexdigest()
+        expected_checksum = hashlib.md5(b'', usedforsecurity=False).hexdigest()
         expected_multihash = hashlib.sha256(b'').hexdigest()
         CHUNKSIZE = 100
-        checksum = md5(usedforsecurity=False)
+        checksum = hashlib.md5(usedforsecurity=False)
         os_hash_value = hashlib.sha256()
         data_file = tempfile.NamedTemporaryFile()
         infile = open(data_file.name, 'rb')

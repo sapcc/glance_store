@@ -24,7 +24,6 @@ import urllib
 
 from eventlet import tpool
 from oslo_config import cfg
-from oslo_utils import encodeutils
 from oslo_utils import eventletutils
 from oslo_utils import units
 
@@ -260,7 +259,8 @@ class ImageIterator(object):
                                            rados_id=self.user) as conn:
                 with conn.open_ioctx(self.pool) as ioctx:
                     with rbd.Image(ioctx, self.name,
-                                   snapshot=self.snapshot) as image:
+                                   snapshot=self.snapshot,
+                                   read_only=True) as image:
                         size = image.size()
                         bytes_left = size
                         while bytes_left > 0:
@@ -282,6 +282,14 @@ class Store(driver.Store):
 
     EXAMPLE_URL = "rbd://<FSID>/<POOL>/<IMAGE>/<SNAP>"
 
+    def __init__(self, *args, **kargs):
+        super(Store, self).__init__(*args, **kargs)
+        if self.backend_group:
+            self.store_conf = driver.BackendGroupConfiguration(
+                self.OPTIONS, self.backend_group, conf=self.conf)
+        else:
+            self.store_conf = self.conf.glance_store
+
     def get_schemes(self):
         return ('rbd',)
 
@@ -295,11 +303,7 @@ class Store(driver.Store):
     def get_connection(self, conffile, rados_id):
         client = rados.Rados(conffile=conffile, rados_id=rados_id)
 
-        if self.backend_group:
-            timeout = getattr(self.conf,
-                              self.backend_group).rados_connect_timeout
-        else:
-            timeout = self.conf.glance_store.rados_connect_timeout
+        timeout = self.store_conf.rados_connect_timeout
 
         if timeout >= 0:
             t = str(timeout)
@@ -339,23 +343,11 @@ class Store(driver.Store):
                                                    reason=reason)
 
         try:
-            if self.backend_group:
-                chunk = getattr(self.conf,
-                                self.backend_group).rbd_store_chunk_size
-                pool = getattr(self.conf, self.backend_group).rbd_store_pool
-                user = getattr(self.conf, self.backend_group).rbd_store_user
-                conf_file = getattr(self.conf,
-                                    self.backend_group).rbd_store_ceph_conf
-                thin_provisioning = getattr(self.conf,
-                                            self.backend_group).\
-                    rbd_thin_provisioning
-            else:
-                chunk = self.conf.glance_store.rbd_store_chunk_size
-                pool = self.conf.glance_store.rbd_store_pool
-                user = self.conf.glance_store.rbd_store_user
-                conf_file = self.conf.glance_store.rbd_store_ceph_conf
-                thin_provisioning = \
-                    self.conf.glance_store.rbd_thin_provisioning
+            chunk = self.store_conf.rbd_store_chunk_size
+            pool = self.store_conf.rbd_store_pool
+            user = self.store_conf.rbd_store_user
+            conf_file = self.store_conf.rbd_store_ceph_conf
+            thin_provisioning = self.store_conf.rbd_thin_provisioning
 
             self.thin_provisioning = thin_provisioning
             self.chunk_size = chunk * units.Mi
@@ -382,7 +374,7 @@ class Store(driver.Store):
         with self.get_connection(conffile=self.conf_file,
                                  rados_id=self.user) as conn:
             if hasattr(conn, 'get_fsid'):
-                fsid = encodeutils.safe_decode(conn.get_fsid())
+                fsid = conn.get_fsid()
 
         if fsid and self.pool:
             # ensure nothing contains / or any other url-unsafe character
@@ -425,7 +417,8 @@ class Store(driver.Store):
             with conn.open_ioctx(target_pool) as ioctx:
                 try:
                     with rbd.Image(ioctx, loc.image,
-                                   snapshot=loc.snapshot) as image:
+                                   snapshot=loc.snapshot,
+                                   read_only=True) as image:
                         img_info = image.stat()
                         return img_info['size']
                 except rbd.ImageNotFound:
@@ -569,18 +562,7 @@ class Store(driver.Store):
                                  rados_id=self.user) as conn:
             fsid = None
             if hasattr(conn, 'get_fsid'):
-                # Librados's get_fsid is represented as binary
-                # in py3 instead of str as it is in py2.
-                # This is causing problems with ceph.
-                # Decode binary to str fixes these issues.
-                # Fix with encodeutils.safe_decode CAN BE REMOVED
-                # after librados's fix will be stable.
-                #
-                # More information:
-                # https://bugs.launchpad.net/glance-store/+bug/1816721
-                # https://bugs.launchpad.net/cinder/+bug/1816468
-                # https://tracker.ceph.com/issues/38381
-                fsid = encodeutils.safe_decode(conn.get_fsid())
+                fsid = conn.get_fsid()
             with conn.open_ioctx(self.pool) as ioctx:
                 order = int(math.log(self.WRITE_CHUNKSIZE, 2))
                 LOG.debug('creating image %s with order %d and size %d',
@@ -613,6 +595,14 @@ class Store(driver.Store):
                                                               bytes_written,
                                                               chunk_length)
                             bytes_written += chunk_length
+                            # Check if writing this chunk exceeds the
+                            # image_size
+                            if image_size != 0 and bytes_written > image_size:
+                                raise exceptions.Invalid(
+                                    _("Size exceeds: expected %(expected)d "
+                                      "bytes, got %(actual)d bytes") %
+                                    {'expected': image_size,
+                                     'actual': bytes_written})
                             if not (self.thin_provisioning and not any(chunk)):
                                 image.write(chunk, offset)
                             offset += chunk_length
@@ -643,6 +633,23 @@ class Store(driver.Store):
                         pass
 
                     raise exceptions.StorageFull(message=log_msg)
+                except rbd.IncompleteWriteError as exc:
+                    log_msg = (_LE("Failed to store image %(img_name)s "
+                                   "image data exceeded the expected size. "
+                                   "Store Exception %(store_exc)s") %
+                               {'img_name': image_name,
+                                'store_exc': exc})
+                    LOG.error(log_msg)
+
+                    # Delete image if one was created
+                    try:
+                        target_pool = loc.pool or self.pool
+                        self._delete_image(target_pool, loc.image,
+                                           loc.snapshot)
+                    except exceptions.NotFound:
+                        pass
+
+                    raise exceptions.Invalid(message=log_msg)
                 except Exception as exc:
                     log_msg = (_LE("Failed to store image %(img_name)s "
                                    "Store Exception %(store_exc)s") %
@@ -660,9 +667,20 @@ class Store(driver.Store):
 
                     raise exc
 
-        # Make sure we send back the image size whether provided or inferred.
-        if image_size == 0:
-            image_size = bytes_written
+        # If actual bytes written are less than image_size
+        # (when image_size != 0), update accordingly
+        if image_size != 0 and bytes_written != image_size:
+            # Delete image if one was created
+            try:
+                self._delete_image(loc.pool or self.pool, loc.image,
+                                   loc.snapshot)
+            except exceptions.NotFound:
+                pass
+
+            raise exceptions.Invalid(_(
+                "Size mismatch: expected %(expected)d "
+                "bytes, got %(actual)d bytes") % {
+                'expected': image_size, 'actual': bytes_written})
 
         # Add store backend information to location metadata
         metadata = {}
@@ -670,7 +688,7 @@ class Store(driver.Store):
             metadata['store'] = self.backend_group
 
         return (loc.get_uri(),
-                image_size,
+                bytes_written,
                 checksum.hexdigest(),
                 os_hash_value.hexdigest(),
                 metadata)

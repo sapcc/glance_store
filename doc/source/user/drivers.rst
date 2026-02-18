@@ -27,26 +27,30 @@ below the table of supported drivers and maintainers:
      - openstack-glance
    * - RBD
      - Supported
-     - Fei Long Wang
-     - flwang@catalyst.net.nz
-     - flwang
+     - Glance Team
+     - openstack-discuss@lists.openstack.org
+     - openstack-glance
    * - Cinder
      - Supported
-     - Tomoki Sekiyama
-     - tomoki.sekiyama@gmail.com
-     -
+     - Rajat Dhasmana
+     - rajatdhasmana@gmail.com
+     - whoami-rajat
    * - Swift
      - Supported
      - Matthew Oliver
      - matt@oliver.net.au
      - mattoliverau
    * - VMware
-     - Supported
-     - Sabari Murugesan
-     - smurugesan@vmware.com
-     - sabari
+     - Deprecated
+     - N/A
+     - N/A
+     -
    * - S3
      - Supported
      - Naohiro Sameshima
      - naohiro.sameshima@global.ntt
      - nao-shark
+
+.. note::
+  VMWare driver was deprecated in 2024.1 release, because of lack of CI and
+  active maintainers
