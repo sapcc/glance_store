@@ -18,6 +18,7 @@
 import copy
 from unittest import mock
 
+import ddt
 import fixtures
 import hashlib
 import http.client
@@ -61,6 +62,7 @@ SWIFT_CONF = {'swift_store_auth_address': 'localhost:8080',
               }
 
 
+@ddt.ddt
 class SwiftTests(object):
 
     def mock_keystone_client(self):
@@ -1027,6 +1029,58 @@ class SwiftTests(object):
         expected_url_prefix = "swift+config://ref1/glance/"
         self.assertEqual(expected_url_prefix, self.store.url_prefix)
 
+    @ddt.data(
+        # (endpoint, expected_prefix)
+        ('https://swift.example.com/v1', 'swift+https://swift.example.com/'),
+        (None, None),
+    )
+    @ddt.unpack
+    def test_multi_tenant_set_url_prefix(self, endpoint, expected_prefix):
+        self.config(group="swift1", swift_store_endpoint=endpoint)
+        mt_store = swift.MultiTenantStore(self.conf, backend="swift1")
+        mt_store.configure()
+        self.assertEqual(expected_prefix, mt_store.url_prefix)
+
+    @ddt.data(
+        # (uri, with_context, expected)
+        # Matching URI with context
+        ('swift+https://some_endpoint/v1/AUTH_t/glance_img-id/img-id',
+         True, True),
+        # Wrong container prefix
+        ('swift+https://some_endpoint/v1/AUTH_t/other_img-id/img-id',
+         True, False),
+        # Wrong netloc
+        ('swift+https://other_host/v1/AUTH_t/glance_img-id/img-id',
+         True, False),
+        # Wrong scheme
+        ('swift+http://some_endpoint/v1/AUTH_t/glance_img-id/img-id',
+         True, False),
+        # No context — falls back to get_schemes() + container prefix
+        ('swift+https://any_host/v1/AUTH_t/glance_img-id/img-id',
+         False, True),
+        # Too few path segments
+        ('swift+https://some_endpoint/only_one_segment',
+         True, False),
+    )
+    @ddt.unpack
+    def test_multi_tenant_matches_uri(self, uri, with_context, expected):
+        mt_store = swift.MultiTenantStore(self.conf, backend='swift1')
+        mt_store.configure()
+        ctxt = None
+        if with_context:
+            ctxt = mock.MagicMock(
+                user='user', tenant='tenant', auth_token='123',
+                service_catalog=[{
+                    'endpoint_links': [],
+                    'endpoints': [{
+                        'region': 'RegionOne',
+                        'publicURL': 'https://some_endpoint',
+                    }],
+                    'type': 'object-store',
+                    'name': 'Object Storage Service',
+                }])
+        self.assertEqual(expected, mt_store.matches_uri(uri, context=ctxt))
+
     def test_add_already_existing(self):
         """
         Tests that adding an image with an existing identifier
@@ -1404,6 +1458,7 @@ class SwiftTests(object):
         self.assertEqual(main_client, client)
 
 
+@ddt.ddt
 class TestStoreAuthV3(base.MultiStoreBaseTest, SwiftTests,
                       test_store_capabilities.TestStoreCapabilitiesChecking):
 
@@ -2040,6 +2095,8 @@ class TestCreatingLocations(base.MultiStoreBaseTest):
         self.ctxt.service_catalog[0]['endpoints'][0]['region'] = 'WestCarolina'
         self.assertEqual('https://some_endpoint',
                          store._get_endpoint(self.ctxt))
+        self.assertEqual('swift+https', store.scheme)
+        self.assertEqual('some_endpoint', store._storage_netloc)
 
     def test_multi_tenant_location_custom_service_type(self):
         self.config(group="swift1", swift_store_service_type='toy-store')
@@ -2049,6 +2106,8 @@ class TestCreatingLocations(base.MultiStoreBaseTest):
         store._get_endpoint(self.ctxt)
         self.assertEqual('https://some_endpoint',
                          store._get_endpoint(self.ctxt))
+        self.assertEqual('swift+https', store.scheme)
+        self.assertEqual('some_endpoint', store._storage_netloc)
 
     def test_multi_tenant_location_custom_endpoint_type(self):
         self.config(group="swift1", swift_store_endpoint_type='internalURL')
@@ -2056,6 +2115,8 @@ class TestCreatingLocations(base.MultiStoreBaseTest):
         store.configure()
         self.assertEqual('https://some_internal_endpoint',
                          store._get_endpoint(self.ctxt))
+        self.assertEqual('swift+https', store.scheme)
+        self.assertEqual('some_internal_endpoint', store._storage_netloc)
 
 
 class TestChunkReader(base.MultiStoreBaseTest):

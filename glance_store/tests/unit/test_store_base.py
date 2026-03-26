@@ -15,6 +15,7 @@
 
 from unittest import mock
 
+import ddt
 from oslo_config import cfg
 
 import glance_store as store
@@ -24,6 +25,7 @@ from glance_store import multi_backend
 from glance_store.tests import base
 
 
+@ddt.ddt
 class TestStoreBase(base.StoreBaseTest):
 
     def setUp(self):
@@ -42,6 +44,23 @@ class TestStoreBase(base.StoreBaseTest):
                 "could not be configured correctly. Reason: Specify "
                 "at least 'filesystem_store_datadir' or "
                 "'filesystem_store_datadirs' option Disabling add method.")
+
+    @ddt.data(
+        # (prefix, uri, expected)
+        # No prefix set
+        (None, 'swift+https://host/path', False),
+        # Prefix matches
+        ('swift+https://host:8080/',
+         'swift+https://host:8080/v1/AUTH_t/container_id/id', True),
+        # Prefix mismatches
+        ('swift+https://host1:8080/',
+         'swift+https://host2:8080/v1/AUTH_t/container_id/id', False),
+    )
+    @ddt.unpack
+    def test_matches_uri(self, prefix, uri, expected):
+        s = store.driver.Store(mock.MagicMock())
+        s._url_prefix = prefix
+        self.assertEqual(expected, s.matches_uri(uri))
 
 
 class TestMultiStoreBase(base.MultiStoreBaseTest):
