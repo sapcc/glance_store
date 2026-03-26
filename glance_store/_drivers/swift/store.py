@@ -1487,24 +1487,30 @@ class SingleTenantStore(BaseStore):
 class MultiTenantStore(BaseStore):
     EXAMPLE_URL = "swift://<SWIFT_URL>/<CONTAINER>/<FILE>"
 
-    def _get_endpoint(self, context):
+    def configure_add(self):
         if self.backend_group:
-            self.container = getattr(self.conf,
-                                     self.backend_group).swift_store_container
+            self.container = getattr(
+                self.conf, self.backend_group).swift_store_container
         else:
             self.container = self.conf.glance_store.swift_store_container
+        self.scheme = None
+        self.storage_url = None
+        self._storage_netloc = None
+        if self.backend_group:
+            self._set_url_prefix()
 
-        if context is None:
-            reason = _("Multi-tenant Swift storage requires a context.")
-            raise exceptions.BadStoreConfiguration(store_name="swift",
-                                                   reason=reason)
-        if context.service_catalog is None:
-            reason = _("Multi-tenant Swift storage requires "
-                       "a service catalog.")
-            raise exceptions.BadStoreConfiguration(store_name="swift",
-                                                   reason=reason)
+    def _get_endpoint(self, context=None):
         self.storage_url = self.conf_endpoint
         if not self.storage_url:
+            if context is None:
+                reason = _("Multi-tenant Swift storage requires a context.")
+                raise exceptions.BadStoreConfiguration(
+                    store_name="swift", reason=reason)
+            if context.service_catalog is None:
+                reason = _("Multi-tenant Swift storage requires "
+                           "a service catalog.")
+                raise exceptions.BadStoreConfiguration(
+                    store_name="swift", reason=reason)
             catalog = keystone_sc.ServiceCatalogV2(context.service_catalog)
             self.storage_url = catalog.url_for(service_type=self.service_type,
                                                region_name=self.region,
@@ -1514,6 +1520,8 @@ class MultiTenantStore(BaseStore):
             self.scheme = 'swift+http'
         else:
             self.scheme = 'swift+https'
+
+        self._storage_netloc = urllib.parse.urlsplit(self.storage_url).netloc
 
         return self.storage_url
 
@@ -1570,9 +1578,37 @@ class MultiTenantStore(BaseStore):
                              backend_group=self.backend_group)
 
     def _set_url_prefix(self, context=None):
-        ep = self._get_endpoint(context)
-        self._url_prefix = "%s://%s:%s_" % (
-            self.scheme, ep, self.container)
+        # Attempt to resolve self._storage_netloc and self.scheme
+        if not self._storage_netloc or not self.scheme:
+            try:
+                self._get_endpoint(context)
+            except exceptions.BadStoreConfiguration:
+                LOG.debug("Cannot set url_prefix for multi-tenant Swift "
+                          "store. Endpoint unknown.")
+                return
+        self._url_prefix = f"{self.scheme}://{self._storage_netloc}/"
+
+    def matches_uri(self, uri, context=None):
+        # Attempt to resolve self._storage_netloc and self.scheme if unset
+        if not self._storage_netloc or not self.scheme:
+            try:
+                self._get_endpoint(context)
+            except exceptions.BadStoreConfiguration:
+                pass
+        # Validate scheme
+        parsed = urllib.parse.urlsplit(uri)
+        if self.scheme and parsed.scheme != self.scheme:
+            return False
+        if not self.scheme and parsed.scheme not in self.get_schemes():
+            return False
+        # Validate netloc
+        if self._storage_netloc and parsed.netloc != self._storage_netloc:
+            return False
+        # Validate the container prefix in the second-to-last path segment
+        parts = parsed.path.strip('/').split('/')
+        if len(parts) >= 2:
+            return parts[-2].startswith(self.container + '_')
+        return False
 
     def get_connection(self, location, context=None):
         return swiftclient.Connection(
@@ -1608,7 +1644,7 @@ class MultiTenantStore(BaseStore):
         project_domain_name = default_swift_reference.get(
             'project_domain_name')
 
-        if self.backend_group:
+        if self.backend_group and not self._url_prefix:
             self._set_url_prefix(context=context)
 
         # create client for multitenant user(trustor)
