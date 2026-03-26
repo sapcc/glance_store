@@ -89,6 +89,11 @@ class Store(capabilities.StoreCapability):
     def url_prefix(self):
         return self._url_prefix
 
+    def matches_uri(self, uri, context=None):
+        """Check if this store can handle the given location URI."""
+        return self._url_prefix is not None and uri.startswith(
+            self._url_prefix)
+
     @property
     def weight(self):
         if self.backend_group is None:
