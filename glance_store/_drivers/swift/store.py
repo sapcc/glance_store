@@ -466,6 +466,28 @@ Related options:
     * swift_upload_buffer_dir
 
 """),
+    cfg.StrOpt('swift_store_public_acl',
+               default='*:*',
+               help="""
+ACL string to set on Swift containers when an image is made public.
+
+This value is set as the ``X-Container-Read`` header when a public
+ACL is applied via ``set_acls()``. The default value grants anonymous
+read access and enables container listings, which is appropriate for
+standard Swift deployments.
+
+For Ceph Object Gateway (RGW) deployments, you may need to use
+``.r:*,.rlistings`` instead, of ``*:*`` as RGW does not support the syntax.
+
+Possible values:
+    * ``*:*`` (standard Swift — default)
+    * ``.r:*,.rlistings`` (Ceph Object Gateway / RGW)
+    * Any valid Swift container read ACL string
+
+Related options:
+    * swift_store_multi_tenant
+
+"""),
 ]
 
 
@@ -1545,7 +1567,12 @@ class MultiTenantStore(BaseStore):
 
         headers = {}
         if public:
-            headers['X-Container-Read'] = "*:*"
+            if self.backend_group:
+                pub_acl = getattr(self.conf,
+                                  self.backend_group).swift_store_public_acl
+            else:
+                pub_acl = self.conf.glance_store.swift_store_public_acl
+            headers['X-Container-Read'] = pub_acl
         elif read_tenants:
             headers['X-Container-Read'] = ','.join('%s:*' % i
                                                    for i in read_tenants)

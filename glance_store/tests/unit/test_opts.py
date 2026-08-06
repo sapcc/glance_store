@@ -129,6 +129,7 @@ class OptsTestCase(base.StoreBaseTest):
             'swift_store_large_object_size',
             'swift_store_multi_tenant',
             'swift_store_multiple_containers_seed',
+            'swift_store_public_acl',
             'swift_store_region',
             'swift_store_retry_get_count',
             'swift_store_service_type',
