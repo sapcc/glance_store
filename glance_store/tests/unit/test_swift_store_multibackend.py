@@ -1293,7 +1293,27 @@ class SwiftTests(object):
         store.set_acls(loc, public=True, context=ctxt)
         container_headers = swiftclient.client.head_container('x', 'y',
                                                               'glance')
-        self.assertEqual("*:*", container_headers['X-Container-Read'])
+        self.assertEqual("*:*",
+                         container_headers['X-Container-Read'])
+
+    def test_read_acl_public_custom(self):
+        """
+        Test that a custom public acl is used when set.
+        """
+        self.config(group="swift1", swift_store_config_file=None)
+        self.config(group="swift1", swift_store_multi_tenant=True)
+        self.config(group="swift1", swift_store_public_acl='.r:*,.rlistings')
+        store = Store(self.conf, backend="swift1")
+        store.configure()
+        uri = "swift+http://storeurl/glance/%s" % FAKE_UUID
+        loc = location.get_location_from_uri_and_backend(
+            uri, "swift1", conf=self.conf)
+        ctxt = mock.MagicMock()
+        store.set_acls(loc, public=True, context=ctxt)
+        container_headers = swiftclient.client.head_container('x', 'y',
+                                                              'glance')
+        self.assertEqual('.r:*,.rlistings',
+                         container_headers['X-Container-Read'])
 
     def test_read_acl_tenants(self):
         """
