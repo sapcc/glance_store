@@ -477,7 +477,7 @@ read access and enables container listings, which is appropriate for
 standard Swift deployments.
 
 For Ceph Object Gateway (RGW) deployments, you may need to use
-``*.*`` instead, as RGW does not support the ``.r:*`` syntax.
+``.r:*,.rlistings`` instead, of ``*:*`` as RGW does not support the syntax.
 
 Possible values:
     * ``*:*`` (standard Swift — default)
@@ -1567,7 +1567,12 @@ class MultiTenantStore(BaseStore):
 
         headers = {}
         if public:
-            pub_acl = self.conf.glance_store.swift_store_public_acl
+            if self.backend_group:
+                        pub_acl = getattr(
+                            self.conf,
+                            self.backend_group).swift_store_public_acl
+            else:
+                pub_acl = self.conf.glance_store.swift_store_public_acl
             headers['X-Container-Read'] = pub_acl
         elif read_tenants:
             headers['X-Container-Read'] = ','.join('%s:*' % i
