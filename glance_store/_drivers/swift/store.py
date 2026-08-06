@@ -1568,9 +1568,8 @@ class MultiTenantStore(BaseStore):
         headers = {}
         if public:
             if self.backend_group:
-                        pub_acl = getattr(
-                            self.conf,
-                            self.backend_group).swift_store_public_acl
+                pub_acl = getattr(self.conf,
+                                  self.backend_group).swift_store_public_acl
             else:
                 pub_acl = self.conf.glance_store.swift_store_public_acl
             headers['X-Container-Read'] = pub_acl
