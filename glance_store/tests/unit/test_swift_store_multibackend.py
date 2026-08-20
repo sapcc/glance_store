@@ -1383,7 +1383,22 @@ class SwiftTests(object):
                               swift_store_auth_insecure=True,
                               swift_store_config_file=None)
 
-    def _init_client(self, verify, **kwargs):
+    def test_init_client_multi_tenant_access_info_v3(self):
+        class AccessInfoV3Stub(object):
+            pass
+
+        auth_ref = AccessInfoV3Stub()
+        auth_ref.role_names = ['member', 'load-balancer_member']
+        with mock.patch.object(swift.MultiTenantStore, '_set_url_prefix'):
+            self._init_client(
+                verify=True,
+                auth_ref=auth_ref,
+                expected_role_names=['member', 'load-balancer_member'],
+                swift_store_multi_tenant=True,
+                swift_store_config_file=None)
+
+    def _init_client(self, verify, auth_ref=None, expected_role_names=None,
+                     **kwargs):
         # initialize store and connection parameters
         self.config(group="swift1", **kwargs)
         store = Store(self.conf, backend="swift1")
@@ -1398,9 +1413,11 @@ class SwiftTests(object):
         trustee_client = mock.MagicMock()
         trustee_client.session.get_user_id.return_value = 'fake_user'
         trustor_client = mock.MagicMock()
-        trustor_client.session.auth.get_auth_ref.return_value = {
-            'roles': [{'name': 'fake_role'}]
-        }
+        if auth_ref is None:
+            auth_ref = {'roles': [{'name': 'fake_role'}]}
+        if expected_role_names is None:
+            expected_role_names = ['fake_role']
+        trustor_client.session.auth.get_auth_ref.return_value = auth_ref
         trustor_client.trusts.create.return_value = mock.MagicMock(
             id='fake_trust')
         main_client = mock.MagicMock()
@@ -1441,7 +1458,7 @@ class SwiftTests(object):
         trustor_client.trusts.create.assert_called_once_with(
             trustee_user='fake_user', trustor_user=ctxt.user_id,
             project=ctxt.project_id, impersonation=True,
-            role_names=['fake_role']
+            role_names=expected_role_names
         )
         self.mock_identity.V3Password.assert_any_call(
             auth_url=default_swift_reference.get('auth_address'),
