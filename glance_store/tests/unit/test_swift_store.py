@@ -1360,10 +1360,7 @@ class SwiftTests(object):
                           swift_store_config_file=None)
 
     def test_init_client_multi_tenant_access_info_v3(self):
-        class AccessInfoV3Stub(object):
-            pass
-
-        auth_ref = AccessInfoV3Stub()
+        auth_ref = mock.MagicMock(spec=['role_names'])
         auth_ref.role_names = ['member', 'load-balancer_member']
         self._init_client(
             verify=True,
