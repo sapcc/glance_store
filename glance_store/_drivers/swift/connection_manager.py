@@ -191,9 +191,10 @@ class MultiTenantConnectionManager(SwiftConnectionManager):
                 return super(MultiTenantConnectionManager,
                              self)._init_connection()
             except Exception as e:
-                LOG.debug("Cannot initialize swift connection for multi-tenant"
-                          " store with trustee token: %s. Using user token for"
-                          " connection initialization.", e)
+                LOG.warning(
+                    "Cannot initialize swift connection for multi-tenant "
+                    "store with trustee token: %s. Using user token for "
+                    "connection initialization.", e)
                 # for multi-tenant store we have a token, so we can use it
                 # for connection initialization but we cannot fetch new token
                 # with client
