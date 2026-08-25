@@ -26,6 +26,7 @@ import io
 import tempfile
 import uuid
 
+import ddt
 from oslo_config import cfg
 from oslo_utils import units
 import requests_mock
@@ -65,6 +66,7 @@ SWIFT_CONF = {'swift_store_auth_address': 'localhost:8080',
               }
 
 
+@ddt.ddt
 class SwiftTests(object):
 
     def mock_keystone_client(self):
@@ -1260,6 +1262,53 @@ class SwiftTests(object):
         # Expecting 6 delete calls, 5 for the segments and 1 for the manifest
         self.assertEqual(6, SWIFT_DELETE_OBJECT_CALLS)
 
+    def _multi_tenant_store_and_location(
+            self) -> "tuple[swift.BaseStore, location.Location]":
+        """Configure a multi-tenant store and return it with a location."""
+        self.config(swift_store_config_file=None)
+        self.config(swift_store_multi_tenant=True)
+        store = Store(self.conf)
+        store.configure()
+        uri = "swift+http://storeurl/glance/%s" % FAKE_UUID
+        loc = location.get_location_from_uri(uri, conf=self.conf)
+        return store, loc
+
+    def test_multi_tenant_delete_container_not_authenticated(self):
+        """
+        Test that multi-tenant delete raises NotAuthenticated for unauthorized
+        container deletion
+        """
+        store, loc = self._multi_tenant_store_and_location()
+        conn = mock.MagicMock()
+        conn.head_object.return_value = {}
+        conn.delete_container.side_effect = swiftclient.ClientException(
+            'Unauthorized', http_status=http.client.UNAUTHORIZED)
+        self.assertRaises(exceptions.NotAuthenticated, store.delete,
+                          loc, connection=conn, context=mock.MagicMock())
+
+    def test_multi_tenant_delete_object_not_authenticated(self):
+        """
+        Test that multi-tenant delete raises NotAuthenticated for unauthorized
+        object deletion
+        """
+        store, loc = self._multi_tenant_store_and_location()
+        conn = mock.MagicMock()
+        conn.head_object.return_value = {}
+        conn.delete_object.side_effect = swiftclient.ClientException(
+            'Unauthorized', http_status=http.client.UNAUTHORIZED)
+        self.assertRaises(exceptions.NotAuthenticated, store.delete,
+                          loc, connection=conn, context=mock.MagicMock())
+
+    def test_multi_tenant_delete_reraises_other_errors(self):
+        """Test that multi-tenant delete does not mask all Swift errors"""
+        store, loc = self._multi_tenant_store_and_location()
+        conn = mock.MagicMock()
+        conn.head_object.return_value = {}
+        conn.delete_container.side_effect = swiftclient.ClientException(
+            'Boom', http_status=http.client.INTERNAL_SERVER_ERROR)
+        self.assertRaises(swiftclient.ClientException, store.delete,
+                          loc, connection=conn, context=mock.MagicMock())
+
     def test_read_acl_public(self):
         """
         Test that we can set a public read acl.
@@ -1311,6 +1360,19 @@ class SwiftTests(object):
                                                               'glance')
         self.assertEqual('frank:*,jim:*', container_headers[
             'X-Container-Write'])
+
+    @ddt.data((http.client.UNAUTHORIZED, exceptions.NotAuthenticated),
+              (http.client.NOT_FOUND, exceptions.NotFound),
+              (http.client.INTERNAL_SERVER_ERROR, swiftclient.ClientException))
+    @ddt.unpack
+    def test_set_acls_error_translation(self, status, expected):
+        """Test that set_acls maps Swift status codes to store exceptions"""
+        store, loc = self._multi_tenant_store_and_location()
+        conn = mock.MagicMock()
+        conn.post_container.side_effect = swiftclient.ClientException(
+            'x', http_status=status)
+        self.assertRaises(expected, store.set_acls, loc, public=True,
+                          connection=conn, context=mock.MagicMock())
 
     @mock.patch("glance_store._drivers.swift."
                 "connection_manager.MultiTenantConnectionManager")
