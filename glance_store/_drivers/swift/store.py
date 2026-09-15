@@ -1529,8 +1529,22 @@ class MultiTenantStore(BaseStore):
         if not connection:
             connection = self.get_connection(location.store_location,
                                              context=context)
-        super(MultiTenantStore, self).delete(location, connection)
-        connection.delete_container(location.store_location.container)
+        try:
+            try:
+                super(MultiTenantStore, self).delete(location, connection)
+            # Ignore NotFound errors for object deletion. This allows container
+            # cleanup on reattempts after an initial call failed due to a
+            # delete_container exception.
+            except exceptions.NotFound:
+                pass
+            connection.delete_container(location.store_location.container)
+        except swiftclient.ClientException as e:
+            if e.http_status == http.client.UNAUTHORIZED:
+                msg = _("Swift could not authenticate the image deletion "
+                        "request. The token may have expired.")
+                raise exceptions.NotAuthenticated(message=msg)
+            else:
+                raise
 
     def set_acls(self, location, public=False, read_tenants=None,
                  write_tenants=None, connection=None, context=None):
@@ -1565,6 +1579,10 @@ class MultiTenantStore(BaseStore):
             if e.http_status == http.client.NOT_FOUND:
                 msg = _("Swift could not find image at URI.")
                 raise exceptions.NotFound(message=msg)
+            elif e.http_status == http.client.UNAUTHORIZED:
+                msg = _("Swift could not authenticate the container ACL "
+                        "update request. The token may have expired.")
+                raise exceptions.NotAuthenticated(message=msg)
             else:
                 raise
 
