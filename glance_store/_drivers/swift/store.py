@@ -1655,7 +1655,10 @@ class MultiTenantStore(BaseStore):
                                           verify=self.ks_verify)
         trustor_client = ks_client.Client(session=trustor_sess)
         auth_ref = trustor_client.session.auth.get_auth_ref(trustor_sess)
-        roles = [t['name'] for t in auth_ref['roles']]
+        if hasattr(auth_ref, 'role_names'):
+            roles = auth_ref.role_names
+        else:
+            roles = [t['name'] for t in auth_ref['roles']]
 
         # create client for trustee - glance user specified in swift config
         tenant_name, user = user.split(':')
