@@ -1273,6 +1273,19 @@ class SwiftTests(object):
         loc = location.get_location_from_uri(uri, conf=self.conf)
         return store, loc
 
+    def test_multi_tenant_delete_container_not_found(self):
+        """
+        Test that multi-tenant delete succeeds when the container does not
+        exist (e.g. partially deleted image with inconsistent backend state)
+        """
+        store, loc = self._multi_tenant_store_and_location()
+        conn = mock.MagicMock()
+        conn.head_object.return_value = {}
+        conn.delete_container.side_effect = swiftclient.ClientException(
+            'Not Found', http_status=http.client.NOT_FOUND)
+        store.delete(loc, connection=conn, context=mock.MagicMock())
+        conn.delete_container.assert_called_once()
+
     def test_multi_tenant_delete_container_when_object_not_found(self):
         """
         Test that multi-tenant delete does delete the container even when the
